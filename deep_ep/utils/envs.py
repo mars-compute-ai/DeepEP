@@ -6,7 +6,7 @@ import re
 import subprocess
 import torch
 import torch.distributed as dist
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # noinspection PyUnresolvedReferences
 import deep_ep._C as _C
@@ -234,17 +234,28 @@ def get_nvlink_gbs(factor: float = 0.9) -> float:
         return 0
 
 
+def get_default_nic_name() -> str:
+    """
+    Get the NIC whose capabilities are probed: `EP_RDMA_NIC` when set, else `mlx5_0`.
+
+    Returns:
+        nic_name: the NIC device name.
+    """
+    return os.environ.get('EP_RDMA_NIC', 'mlx5_0')
+
+
 @functools.lru_cache()
-def check_fast_rdma_atomic_support(nic_name: str = 'mlx5_0') -> bool:
+def check_fast_rdma_atomic_support(nic_name: Optional[str] = None) -> bool:
     """
     Check whether the NIC supports fast RDMA atomic operations (MT4131 or newer).
 
     Arguments:
-        nic_name: the NIC device name.
+        nic_name: the NIC device name, `get_default_nic_name()` by default.
 
     Returns:
         supported: `True` if fast RDMA atomics are supported.
     """
+    nic_name = nic_name or get_default_nic_name()
     # noinspection PyBroadException
     try:
         result = subprocess.run(['ibstat'], capture_output=True, text=True, check=True)
@@ -258,16 +269,17 @@ def check_fast_rdma_atomic_support(nic_name: str = 'mlx5_0') -> bool:
 
 
 @functools.lru_cache()
-def get_rdma_gbs(nic_name: str = 'mlx5_0') -> float:
+def get_rdma_gbs(nic_name: Optional[str] = None) -> float:
     """
     Get the RDMA bandwidth in GB/s, cached.
 
     Arguments:
-        nic_name: the NIC device name.
+        nic_name: the NIC device name, `get_default_nic_name()` by default.
 
     Returns:
         gbs: the RDMA bandwidth in GB/s (0 if detection fails).
     """
+    nic_name = nic_name or get_default_nic_name()
     # noinspection PyBroadException
     try:
         result = subprocess.run(['ibstat'], capture_output=True, text=True, check=True)

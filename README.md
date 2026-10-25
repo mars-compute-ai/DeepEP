@@ -404,6 +404,7 @@ Set runtime variables before importing `deep_ep` and creating buffers. Flags use
 | `EP_DEFAULT_RDMA_SL` | Unset | Set the Gin traffic class/service level when the buffer's `sl_idx` is not supplied. If both are unset, use NCCL's default. |
 | `EP_OVERRIDE_RDMA_SL` | Unset | Override both `EP_DEFAULT_RDMA_SL` and the buffer's `sl_idx`. |
 | `EP_DISABLE_GIN` | `0` | Skip Gin initialization for NVLink-only use. RDMA operations require Gin; this flag does not select another RDMA backend. |
+| `EP_RDMA_NIC` | `mlx5_0` | The NIC whose rate and atomics are read from `ibstat` for planning, on nodes whose NICs are named otherwise (e.g. `mlx5_bond_0`). |
 | `EP_NUM_MAX_LOCAL_RANKS` | `16` | Engram only: estimate registered storage for `NCCL_WIN_STRIDE` sizing in hybrid mode. This is a sizing estimate, not a rank-count limit. |
 
 **JIT compilation**
