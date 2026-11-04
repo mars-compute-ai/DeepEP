@@ -320,6 +320,29 @@ void combine(void* combined_x,
              uint32_t* src_signals,
              uint32_t src_signal_expect_value);
 
+void combine_payload_flags(void* combined_x,
+                           void* rdma_recv_x,
+                           void* rdma_send_x,
+                           const void* x,
+                           const topk_idx_t* topk_idx,
+                           const float* topk_weights,
+                           const int* src_info,
+                           const int64_t* layout_range,
+                           int* next_clean,
+                           int num_next_clean_int,
+                           int num_combined_tokens,
+                           int hidden,
+                           int num_max_dispatch_tokens_per_rank,
+                           int num_topk,
+                           int num_experts,
+                           int rank,
+                           int num_ranks,
+                           void* workspace,
+                           int buffer_idx,
+                           int num_device_sms,
+                           cudaStream_t stream,
+                           int phases);
+
 void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, cudaStream_t stream);
 
 void update_mask_buffer(int* mask_buffer_ptr, int rank_to_mask, bool mask, cudaStream_t stream);

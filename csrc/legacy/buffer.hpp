@@ -1636,8 +1636,10 @@ public:
         const std::optional<torch::Tensor>& out = std::nullopt,
         bool overlap = false,
         const std::optional<torch::Tensor>& src_signals = std::nullopt,
-        uint32_t src_signal_expect_value = 0) {
+        uint32_t src_signal_expect_value = 0,
+        bool payload_flags = false) {
         EP_HOST_ASSERT(low_latency_mode);
+        EP_HOST_ASSERT(not payload_flags or (not use_logfmt and not zero_copy and not overlap and mask_buffer_ptr == nullptr));
 
         // Tensor checks
         EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1669,6 +1671,7 @@ public:
         // Buffer control
         LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
         EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
+        const int combine_buffer_idx = low_latency_buffer_idx;
         auto buffer = layout.buffers[low_latency_buffer_idx];
         auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
 
@@ -1694,6 +1697,31 @@ public:
         // Kernel launch
         auto next_clean_meta = next_buffer.clean_meta();
         auto launcher = [=, this](int phases) {
+            if (payload_flags) {
+                internode_ll::combine_payload_flags(combined_x.data_ptr(),
+                                                    buffer.combine_rdma_recv_data_buffer,
+                                                    buffer.combine_rdma_send_buffer,
+                                                    x.data_ptr(),
+                                                    topk_idx.data_ptr<topk_idx_t>(),
+                                                    topk_weights.data_ptr<float>(),
+                                                    src_info.data_ptr<int>(),
+                                                    layout_range.data_ptr<int64_t>(),
+                                                    next_clean_meta.first,
+                                                    next_clean_meta.second,
+                                                    num_combined_tokens,
+                                                    hidden,
+                                                    num_max_dispatch_tokens_per_rank,
+                                                    num_topk,
+                                                    num_experts,
+                                                    rank,
+                                                    num_ranks,
+                                                    workspace,
+                                                    combine_buffer_idx,
+                                                    num_device_sms,
+                                                    launch_stream,
+                                                    phases);
+                return;
+            }
             internode_ll::combine(combined_x.data_ptr(),
                                   buffer.combine_rdma_recv_data_buffer,
                                   buffer.combine_rdma_recv_flag_buffer,

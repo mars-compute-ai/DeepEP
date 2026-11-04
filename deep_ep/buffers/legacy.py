@@ -640,7 +640,8 @@ class Buffer:
                             handle: tuple, use_logfmt: bool = False, zero_copy: bool = False, async_finish: bool = False,
                             return_recv_hook: bool = False, out: Optional[torch.Tensor] = None,
                             combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
-                            overlap: bool = False, src_signals: Optional[torch.Tensor] = None, src_signal_expect_value: int = 0) -> \
+                            overlap: bool = False, src_signals: Optional[torch.Tensor] = None, src_signal_expect_value: int = 0,
+                            payload_flags: bool = False) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
@@ -666,6 +667,9 @@ class Buffer:
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
                 If you do not set this flag, the kernel will ensure the data's arrival.
             out: the in-place output tensor, if set, the kernel will write the result to this tensor and return it directly.
+            payload_flags: send each token as 16-byte units that carry their own flag, written straight into the peer's
+                buffer over NVLink, so neither the sender's system-scope fence nor the receiver's flag wait and grid sync
+                are needed; NVLink P2P to every rank only, without LogFMT, zero-copy, overlap or rank masking.
             combine_wait_recv_cost_stats: a cumulative time spent waiting to receive each token tensor for statistics,
                 which should have shape `[num_ranks, num_ranks]` and be typed as `torch.int64`.
                 This is useful for detecting and precisely localizing slow anomalies.
@@ -684,7 +688,8 @@ class Buffer:
                                                                    num_max_dispatch_tokens_per_rank, num_experts,
                                                                    use_logfmt, zero_copy, async_finish, return_recv_hook,
                                                                    out,
-                                                                   overlap, src_signals, src_signal_expect_value)
+                                                                   overlap, src_signals, src_signal_expect_value,
+                                                                   payload_flags)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
         return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
 
