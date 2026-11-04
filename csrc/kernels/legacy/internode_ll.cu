@@ -2046,10 +2046,11 @@ combine_payload_flags(void* combined_x,
 
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
     constexpr int kHiddenInt4 = kHidden / kNumElemsPerInt4;
-    constexpr int kNumUnits = kHiddenInt4 * 2;
+    constexpr int kNumElemsPerUnit = sizeof(int2) / sizeof(nv_bfloat16);
+    constexpr int kNumUnits = kHidden / kNumElemsPerUnit;
     constexpr int kNumHalfUnits = kNumUnits / 2;
     constexpr int kNumChunks = 4;
-    constexpr int kChunkInt4 = (kHiddenInt4 + kNumChunks - 1) / kNumChunks;
+    constexpr int kChunkUnits = (kNumUnits + kNumChunks - 1) / kNumChunks;
     constexpr size_t kNumBytesPerSlot = kHidden * sizeof(nv_bfloat16) + kHidden / 128 * sizeof(nv_bfloat162);
     EP_STATIC_ASSERT(kNumHalfUnits * sizeof(int4) <= kNumBytesPerSlot, "Half message exceeds a slot");
 
@@ -2117,14 +2118,13 @@ combine_payload_flags(void* combined_x,
             const auto dst_lo = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x) + slot_offset, rank, dst_rank);
             const auto dst_hi = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_send_x) + slot_offset, rank, dst_rank);
             EP_DEVICE_ASSERT(dst_lo != 0 and dst_hi != 0);
-            const auto x_int4 = local_x + token_idx * kHiddenInt4;
-            const int chunk_end = min(kHiddenInt4, (chunk_idx + 1) * kChunkInt4);
-            for (int i = chunk_idx * kChunkInt4 + lane_id; i < chunk_end; i += 32) {
-                const auto value = ld_nc_global(x_int4 + i);
-                const int unit = i * 2;
+            const auto x_int2 = reinterpret_cast<const int2*>(local_x + token_idx * kHiddenInt4);
+            const int chunk_end = min(kNumUnits, (chunk_idx + 1) * kChunkUnits);
+            #pragma unroll 4
+            for (int unit = chunk_idx * kChunkUnits + lane_id; unit < chunk_end; unit += 32) {
+                const auto value = __ldg(x_int2 + unit);
                 const auto dst = reinterpret_cast<int4*>(unit < kNumHalfUnits ? dst_lo : dst_hi) + (unit % kNumHalfUnits);
                 st_volatile_global_v4(dst, make_int4(value.x, flag, value.y, flag));
-                st_volatile_global_v4(dst + 1, make_int4(value.z, flag, value.w, flag));
             }
         }
 
@@ -2138,68 +2138,66 @@ PAYLOAD_FLAGS_RECV:
     if ((phases & LEGACY_LOW_LATENCY_RECV_PHASE) == 0)
         return;
 
-    // Each thread reduces one int4 of a token's hidden over its top-k units, polling each unit's flags
+    // Each thread reduces one unit (4 BF16) of a token's hidden over its top-k slots, polling each unit's flags
     {
-        constexpr int kTokensPerCTA = 1024 / kHiddenInt4;
-        constexpr int kTopkBatch = 4;
-        EP_STATIC_ASSERT(kTokensPerCTA >= 1, "Hidden too large for one CTA");
+        constexpr int kThreadsPerToken = kNumUnits < 1024 ? kNumUnits : 1024;
+        constexpr int kTokensPerCTA = 1024 / kThreadsPerToken;
+        constexpr int kTopkBatch = 8;
         const int flag = payload_flags_value(shared_recv_seq);
-        const int token_in_cta = thread_id / kHiddenInt4;
-        const int i = thread_id % kHiddenInt4;
-        const int unit = i * 2;
-        const auto recv_base = static_cast<const uint8_t*>(unit < kNumHalfUnits ? rdma_recv_x : rdma_send_x);
+        const int token_in_cta = thread_id / kThreadsPerToken;
+        const int thread_in_token = thread_id % kThreadsPerToken;
         if (token_in_cta < kTokensPerCTA) {
             for (int token_idx = sm_id * kTokensPerCTA + token_in_cta; token_idx < num_combined_tokens; token_idx += num_sms * kTokensPerCTA) {
-                float combined_values[kNumElemsPerInt4] = {0.0f};
-                for (int k_base = 0; k_base < num_topk; k_base += kTopkBatch) {
-                    int4 list_lo[kTopkBatch], list_hi[kTopkBatch];
-                    const int4* list_ptr[kTopkBatch];
-                    float list_weight[kTopkBatch];
-                    #pragma unroll
-                    for (int k = 0; k < kTopkBatch; ++k) {
-                        list_ptr[k] = nullptr;
-                        list_weight[k] = 0.0f;
-                        const int topk_slot = k_base + k;
-                        if (topk_slot < num_topk) {
-                            const int expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + topk_slot));
-                            if (expert_idx >= 0) {
-                                list_weight[k] = __ldg(topk_weights + token_idx * num_topk + topk_slot);
-                                list_ptr[k] = reinterpret_cast<const int4*>(
-                                    recv_base + (static_cast<uint64_t>(expert_idx) * num_max_dispatch_tokens_per_rank + token_idx) * kNumBytesPerSlot) +
-                                    (unit % kNumHalfUnits);
-                                list_lo[k] = ld_volatile_global_v4(list_ptr[k]);
-                                list_hi[k] = ld_volatile_global_v4(list_ptr[k] + 1);
-                            }
-                        }
-                    }
-                    #pragma unroll
-                    for (int k = 0; k < kTopkBatch; ++k) {
-                        if (list_ptr[k] == nullptr)
-                            continue;
-                        auto start_time = clock64();
-                        while (list_lo[k].y != flag or list_lo[k].w != flag or list_hi[k].y != flag or list_hi[k].w != flag) {
-                            if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
-                                printf("DeepEP payload-flags combine timeout, rank %d, token %d\n", rank, token_idx);
-                                trap();
-                            }
-                            list_lo[k] = ld_volatile_global_v4(list_ptr[k]);
-                            list_hi[k] = ld_volatile_global_v4(list_ptr[k] + 1);
-                        }
-                        const int list_data[4] = {list_lo[k].x, list_lo[k].z, list_hi[k].x, list_hi[k].z};
+                for (int unit = thread_in_token; unit < kNumUnits; unit += kThreadsPerToken) {
+                    const auto recv_base = static_cast<const uint8_t*>(unit < kNumHalfUnits ? rdma_recv_x : rdma_send_x);
+                    float combined_values[kNumElemsPerUnit] = {0.0f};
+                    for (int k_base = 0; k_base < num_topk; k_base += kTopkBatch) {
+                        int4 list_unit[kTopkBatch];
+                        const int4* list_ptr[kTopkBatch];
+                        float list_weight[kTopkBatch];
                         #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            const auto pair = *reinterpret_cast<const nv_bfloat162*>(&list_data[j]);
-                            combined_values[j * 2] += static_cast<float>(pair.x) * list_weight[k];
-                            combined_values[j * 2 + 1] += static_cast<float>(pair.y) * list_weight[k];
+                        for (int k = 0; k < kTopkBatch; ++k) {
+                            list_ptr[k] = nullptr;
+                            list_weight[k] = 0.0f;
+                            const int topk_slot = k_base + k;
+                            if (topk_slot < num_topk) {
+                                const int expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + topk_slot));
+                                if (expert_idx >= 0) {
+                                    list_weight[k] = __ldg(topk_weights + token_idx * num_topk + topk_slot);
+                                    list_ptr[k] = reinterpret_cast<const int4*>(
+                                        recv_base + (static_cast<uint64_t>(expert_idx) * num_max_dispatch_tokens_per_rank + token_idx) * kNumBytesPerSlot) +
+                                        (unit % kNumHalfUnits);
+                                    list_unit[k] = ld_volatile_global_v4(list_ptr[k]);
+                                }
+                            }
+                        }
+                        #pragma unroll
+                        for (int k = 0; k < kTopkBatch; ++k) {
+                            if (list_ptr[k] == nullptr)
+                                continue;
+                            auto start_time = clock64();
+                            while (list_unit[k].y != flag or list_unit[k].w != flag) {
+                                if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
+                                    printf("DeepEP payload-flags combine timeout, rank %d, token %d\n", rank, token_idx);
+                                    trap();
+                                }
+                                list_unit[k] = ld_volatile_global_v4(list_ptr[k]);
+                            }
+                            const int list_data[2] = {list_unit[k].x, list_unit[k].z};
+                            #pragma unroll
+                            for (int j = 0; j < 2; ++j) {
+                                const auto pair = *reinterpret_cast<const nv_bfloat162*>(&list_data[j]);
+                                combined_values[j * 2] += static_cast<float>(pair.x) * list_weight[k];
+                                combined_values[j * 2 + 1] += static_cast<float>(pair.y) * list_weight[k];
+                            }
                         }
                     }
+                    int2 out;
+                    auto out_bf16 = reinterpret_cast<nv_bfloat162*>(&out);
+                    out_bf16[0] = __floats2bfloat162_rn(combined_values[0], combined_values[1]);
+                    out_bf16[1] = __floats2bfloat162_rn(combined_values[2], combined_values[3]);
+                    reinterpret_cast<int2*>(combined_x)[static_cast<int64_t>(token_idx) * kNumUnits + unit] = out;
                 }
-                int4 out;
-                auto out_bf16 = reinterpret_cast<nv_bfloat162*>(&out);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j)
-                    out_bf16[j] = __floats2bfloat162_rn(combined_values[j * 2], combined_values[j * 2 + 1]);
-                static_cast<int4*>(combined_x)[token_idx * kHiddenInt4 + i] = out;
             }
         }
     }

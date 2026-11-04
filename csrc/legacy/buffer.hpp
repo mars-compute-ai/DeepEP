@@ -1752,7 +1752,9 @@ public:
                                   src_signals.has_value() ? src_signals->data_ptr<uint32_t>() : nullptr,
                                   src_signal_expect_value);
         };
-        launcher(return_recv_hook ? LEGACY_LOW_LATENCY_SEND_PHASE : (LEGACY_LOW_LATENCY_SEND_PHASE | LEGACY_LOW_LATENCY_RECV_PHASE));
+        // A payload-flags combine needs no fence between its phases, so both run in the first launch and the hook only orders
+        launcher((return_recv_hook and not payload_flags) ? LEGACY_LOW_LATENCY_SEND_PHASE
+                                                          : (LEGACY_LOW_LATENCY_SEND_PHASE | LEGACY_LOW_LATENCY_RECV_PHASE));
 
         // Wait streams
         std::optional<EventHandle> event;
@@ -1766,7 +1768,9 @@ public:
 
         // Receiver callback
         std::optional<std::function<void()>> recv_hook = std::nullopt;
-        if (return_recv_hook)
+        if (return_recv_hook and payload_flags)
+            recv_hook = []() {};
+        else if (return_recv_hook)
             recv_hook = [=]() { launcher(LEGACY_LOW_LATENCY_RECV_PHASE); };
 
         // Return values
