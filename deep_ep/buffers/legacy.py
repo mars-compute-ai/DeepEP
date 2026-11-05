@@ -557,7 +557,8 @@ class Buffer:
                              x_global_scale: Optional[torch.Tensor] = None,
                              use_fp8: bool = True, round_scale: bool = False, use_ue8m0: bool = False,
                              use_nvfp4: bool = False,
-                             async_finish: bool = False, return_recv_hook: bool = False) -> \
+                             async_finish: bool = False, return_recv_hook: bool = False,
+                             payload_flags: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         A low-latency implementation for dispatching with IBGDA.
@@ -588,6 +589,10 @@ class Buffer:
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
                 If you do not set this flag, the kernel will ensure the data's arrival.
+            payload_flags: write each token's FP8 chunks as 16-byte units that carry their own flag straight into the
+                peers' buffers over NVLink, with the per-expert counts flagged the same way, so no system-scope release,
+                count wait or grid sync is needed and both phases run in the first launch (the hook is then a no-op);
+                FP8 over NVLink P2P to every rank only, without rank masking or wait-cost stats.
 
         Returns:
             recv_x: a tensor or tuple with received tokens for each expert.
@@ -623,7 +628,8 @@ class Buffer:
                                               num_max_dispatch_tokens_per_rank, num_experts,
                                               use_fp8, round_scale, use_ue8m0,
                                               use_nvfp4,
-                                              async_finish, return_recv_hook)
+                                              async_finish, return_recv_hook,
+                                              payload_flags)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx,
                              packed_recv_x, packed_recv_x_scales, packed_recv_count,
