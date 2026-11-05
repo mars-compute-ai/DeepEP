@@ -1637,9 +1637,11 @@ public:
         bool overlap = false,
         const std::optional<torch::Tensor>& src_signals = std::nullopt,
         uint32_t src_signal_expect_value = 0,
-        bool payload_flags = false) {
+        bool payload_flags = false,
+        bool payload_flags_cta_clean = false) {
         EP_HOST_ASSERT(low_latency_mode);
         EP_HOST_ASSERT(not payload_flags or (not use_logfmt and not zero_copy and not overlap and mask_buffer_ptr == nullptr));
+        EP_HOST_ASSERT(payload_flags or not payload_flags_cta_clean);
 
         // Tensor checks
         EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1719,7 +1721,8 @@ public:
                                                     combine_buffer_idx,
                                                     num_device_sms,
                                                     launch_stream,
-                                                    phases);
+                                                    phases,
+                                                    payload_flags_cta_clean);
                 return;
             }
             internode_ll::combine(combined_x.data_ptr(),

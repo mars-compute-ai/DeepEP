@@ -341,7 +341,8 @@ void combine_payload_flags(void* combined_x,
                            int buffer_idx,
                            int num_device_sms,
                            cudaStream_t stream,
-                           int phases);
+                           int phases,
+                           bool cta_clean);
 
 void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, cudaStream_t stream);
 

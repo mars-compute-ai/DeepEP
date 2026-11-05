@@ -2003,6 +2003,8 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 
 // Fence-free combine over NVLink P2P: every 16-byte unit carries 8 bytes of BF16 data and the call's flag twice,
 // so a receiver accepts each unit on its own and no sender issues a system-scope fence.
+// With cta_clean, every CTA clears the next buffer's signals itself and fences before its own sends,
+// instead of waiting for CTA 0's clean through the shared clean flag.
 constexpr int kPayloadFlagsNumSeqSlots = 256;
 constexpr size_t kPayloadFlagsSeqOffsetBytes = 16 * 1024 * 1024;
 
@@ -2034,7 +2036,7 @@ combine_payload_flags(void* combined_x,
                       int num_max_dispatch_tokens_per_rank,
                       int num_experts, int rank, int num_ranks,
                       int num_warp_groups, int num_warps_per_group,
-                      int phases) {
+                      int phases, bool cta_clean) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -2082,7 +2084,13 @@ combine_payload_flags(void* combined_x,
         goto PAYLOAD_FLAGS_RECV;
 
     // Clean the next buffer's signals before any peer can see this call's data
-    if (sm_id == 0 and warp_id == 0) {
+    if (cta_clean) {
+        for (int i = thread_id; i < num_next_clean_int; i += blockDim.x) {
+            next_clean[i] = 0;
+            __threadfence();
+        }
+        __syncthreads();
+    } else if (sm_id == 0 and warp_id == 0) {
         #pragma unroll
         for (int i = lane_id; i < num_next_clean_int; i += 32)
             next_clean[i] = 0;
@@ -2104,7 +2112,7 @@ combine_payload_flags(void* combined_x,
         int offset, num_tokens_to_send;
         unpack2(layout, num_tokens_to_send, offset);
 
-        if (lane_id == 0) {
+        if (lane_id == 0 and not cta_clean) {
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
         }
@@ -2130,7 +2138,7 @@ combine_payload_flags(void* combined_x,
 
         // Return the clean flag once every warp of the group has sent
         asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 1), "r"(num_warps_per_group * 32));
-        if (sub_warp_id == 0 and lane_id == 0)
+        if (sub_warp_id == 0 and lane_id == 0 and not cta_clean)
             atomic_add_release_global(atomic_clean_flag, -1);
     }
 
@@ -2224,7 +2232,8 @@ void combine_payload_flags(void* combined_x,
                            int buffer_idx,
                            int num_device_sms,
                            cudaStream_t stream,
-                           int phases) {
+                           int phases,
+                           bool cta_clean) {
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
     const int num_sms = ceil_div(num_experts, num_warp_groups);
@@ -2242,7 +2251,7 @@ void combine_payload_flags(void* combined_x,
                       src_info, layout_range, next_clean, num_next_clean_int,                         \
                       atomic_clean_flag, seq_counters, num_combined_tokens, num_topk,                 \
                       num_max_dispatch_tokens_per_rank, num_experts, rank, num_ranks,                 \
-                      num_warp_groups, num_warps_per_group, phases);                                  \
+                      num_warp_groups, num_warps_per_group, phases, cta_clean);                       \
     }                                                                                                 \
     break
     SWITCH_HIDDEN(PAYLOAD_FLAGS_COMBINE_LAUNCH_CASE);
