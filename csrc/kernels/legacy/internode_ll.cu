@@ -2249,6 +2249,357 @@ void combine_payload_flags(void* combined_x,
 #undef PAYLOAD_FLAGS_COMBINE_LAUNCH_CASE
 }
 
+// Fence-free dispatch over NVLink P2P: the FP8 cast writes each 8-byte chunk of a token with the call's flag twice
+// straight into every top-k peer slot, and each (expert, source rank) count travels as a flagged unit too, so no sender
+// issues a system-scope release and the receiver accepts every unit on its own
+constexpr size_t kPayloadFlagsDispatchSeqOffsetBytes = kPayloadFlagsSeqOffsetBytes + 4 * kPayloadFlagsNumSeqSlots * sizeof(int);
+constexpr int kPayloadFlagsDispatchNumMaxTopk = 16;
+constexpr int kPayloadFlagsDispatchRecvBatch = 6;
+
+template <int kHidden>
+struct PayloadFlagsDispatchLayout {
+    static constexpr int kNumDataUnits = kHidden / (sizeof(int4) / sizeof(nv_bfloat16));
+    static constexpr int kNumScaleUnits = kNumDataUnits / 32;
+    static constexpr int kSrcUnit = kNumDataUnits + kNumScaleUnits;
+    static constexpr int kNumUnits = kSrcUnit + 1;
+    static constexpr int kNumLoUnits = (kNumUnits + 1) / 2;
+    static constexpr size_t kNumSlotBytes = kNumLoUnits * sizeof(int4);
+    static constexpr int kNumCopies = 1024 / kNumDataUnits;
+};
+
+template <bool kUseUE8M0, int kHidden>
+__global__ __launch_bounds__(1024, 1) void
+dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* packed_recv_src_info,
+                       int64_t* packed_recv_layout_range, int* packed_recv_count,
+                       int* cumulative_local_expert_recv_stats,
+                       void* rdma_recv_x, void* rdma_send_x,
+                       const void* x, const topk_idx_t* topk_idx,
+                       int* next_clean, int num_next_clean_int, int* seq_counters,
+                       int num_tokens, int num_max_dispatch_tokens_per_rank, int num_topk,
+                       int num_experts, int rank, int num_ranks,
+                       int num_warp_groups, int num_warps_per_group,
+                       bool round_scale, int phases) {
+    using Layout = PayloadFlagsDispatchLayout<kHidden>;
+    using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
+    using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
+    constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
+    constexpr int kNumPerChannels = 128;
+    constexpr int kNumMaxWarpGroups = 32;
+    EP_STATIC_ASSERT(Layout::kNumDataUnits % 32 == 0 and Layout::kNumDataUnits <= 1024, "Invalid hidden");
+    EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
+
+    const auto sm_id = static_cast<int>(blockIdx.x);
+    const auto num_sms = static_cast<int>(gridDim.x);
+    const auto thread_id = static_cast<int>(threadIdx.x);
+    const auto warp_id = thread_id / 32, lane_id = get_lane_id();
+    const auto num_warps = num_warp_groups * num_warps_per_group;
+    const auto num_local_experts = num_experts / num_ranks;
+    const auto warp_group_id = warp_id / num_warps_per_group;
+    const auto sub_warp_id = warp_id % num_warps_per_group;
+    const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+    const size_t num_hi_region_bytes = static_cast<size_t>(num_experts) * num_max_dispatch_tokens_per_rank * Layout::kNumSlotBytes;
+
+    __shared__ int shared_seq;
+    __shared__ int shared_recv_seq;
+    __shared__ uint64_t shared_dst_lo[kPayloadFlagsDispatchNumMaxTopk];
+    __shared__ uint64_t shared_dst_hi[kPayloadFlagsDispatchNumMaxTopk];
+    __shared__ int shared_num_recv_tokens[kNumMaxWarpGroups];
+    __shared__ int shared_recv_token_begin_idx[kNumMaxWarpGroups];
+    if (thread_id == 0) {
+        if (phases & LEGACY_LOW_LATENCY_SEND_PHASE)
+            shared_seq = seq_counters[sm_id] + 1;
+        if (phases & LEGACY_LOW_LATENCY_RECV_PHASE)
+            shared_recv_seq = seq_counters[kPayloadFlagsNumSeqSlots + sm_id] + 1;
+    }
+    __syncthreads();
+    if (thread_id == 0) {
+        if (phases & LEGACY_LOW_LATENCY_SEND_PHASE)
+            seq_counters[sm_id] = shared_seq;
+        if (phases & LEGACY_LOW_LATENCY_RECV_PHASE)
+            seq_counters[kPayloadFlagsNumSeqSlots + sm_id] = shared_recv_seq;
+    }
+    if (sm_id == 0) {
+        for (int slot = num_sms + thread_id; slot < kPayloadFlagsNumSeqSlots; slot += blockDim.x) {
+            if (phases & LEGACY_LOW_LATENCY_SEND_PHASE)
+                seq_counters[slot] += 1;
+            if (phases & LEGACY_LOW_LATENCY_RECV_PHASE)
+                seq_counters[kPayloadFlagsNumSeqSlots + slot] += 1;
+        }
+    }
+
+    if ((phases & LEGACY_LOW_LATENCY_SEND_PHASE) == 0)
+        goto PAYLOAD_FLAGS_DISPATCH_RECV;
+
+    {
+        const int flag = payload_flags_value(shared_seq);
+
+        // Clean this SM's share of the next buffer's signals, then count the tokens of its experts and send each count
+        // as a flagged unit
+        if (warp_id == num_warps - 1) {
+            const auto expert_begin_idx = sm_id * num_warp_groups;
+            const auto expert_end_idx = min(expert_begin_idx + num_warp_groups, num_experts);
+            const int num_clean_per_sm = ceil_div(num_next_clean_int, num_sms);
+            const int clean_end = min(num_next_clean_int, (sm_id + 1) * num_clean_per_sm);
+            for (int i = sm_id * num_clean_per_sm + lane_id; i < clean_end; i += 32)
+                next_clean[i] = 0;
+            __syncwarp();
+            __threadfence();
+            for (int expert_idx = expert_begin_idx; expert_idx < expert_end_idx; ++expert_idx) {
+                int count = 0;
+                for (int i = lane_id; i < num_tokens * num_topk; i += 32)
+                    count += static_cast<int>(__ldg(topk_idx + i)) == expert_idx;
+                count = warp_reduce_sum(count);
+                if (lane_id == 0) {
+                    const auto dst_rank = expert_idx / num_local_experts;
+                    const auto dst_expert_local_idx = expert_idx % num_local_experts;
+                    const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_send_x) + num_hi_region_bytes +
+                        (dst_expert_local_idx * num_ranks + rank) * sizeof(int4);
+                    const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                    EP_DEVICE_ASSERT(dst_p2p_ptr != 0);
+                    st_volatile_global_v4(reinterpret_cast<int4*>(dst_p2p_ptr), make_int4(count, flag, count, flag));
+                }
+            }
+        }
+
+        // Cast each token and write its flagged units into every top-k peer slot
+        const int copy_idx = thread_id / Layout::kNumDataUnits;
+        const int unit_idx = thread_id % Layout::kNumDataUnits;
+        for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
+            if (warp_id < num_topk) {
+                const int dst_expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id));
+                int slot_idx = 0;
+                if (dst_expert_idx >= 0) {
+                    for (int i = lane_id; i < token_idx * num_topk; i += 32)
+                        slot_idx += static_cast<int>(__ldg(topk_idx + i)) == dst_expert_idx;
+                    slot_idx = warp_reduce_sum(slot_idx);
+                }
+                if (lane_id == 0) {
+                    uint64_t dst_lo = 0, dst_hi = 0;
+                    if (dst_expert_idx >= 0) {
+                        const auto dst_rank = dst_expert_idx / num_local_experts;
+                        const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
+                        const auto slot_offset =
+                            ((static_cast<size_t>(dst_expert_local_idx) * num_ranks + rank) * num_max_dispatch_tokens_per_rank + slot_idx) *
+                            Layout::kNumSlotBytes;
+                        dst_lo = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x) + slot_offset, rank, dst_rank);
+                        dst_hi = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_send_x) + slot_offset, rank, dst_rank);
+                        EP_DEVICE_ASSERT(dst_lo != 0 and dst_hi != 0);
+                    }
+                    shared_dst_lo[warp_id] = dst_lo;
+                    shared_dst_hi[warp_id] = dst_hi;
+                }
+            }
+
+            int2 fp8_value = {0, 0};
+            float scale_inv_lo = 0.0f, scale_inv_hi = 0.0f;
+            if (copy_idx < Layout::kNumCopies) {
+                auto int4_value = __ldg(static_cast<const int4*>(x) + static_cast<size_t>(token_idx) * Layout::kNumDataUnits + unit_idx);
+                auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
+                float fp32_values[kNumElemsPerRead];
+                float amax = kFP8Margin, scale, scale_inv;
+                #pragma unroll
+                for (int j = 0; j < kNumElemsPerRead; ++j) {
+                    fp32_values[j] = static_cast<float>(bf16_values[j]);
+                    amax = fmaxf(amax, fabsf(fp32_values[j]));
+                }
+                amax = warp_reduce_max<16>(amax);
+                calculate_fp8_scales(amax, scale, scale_inv, round_scale);
+                auto fp8x2_values = reinterpret_cast<__nv_fp8x2_storage_t*>(&fp8_value);
+                #pragma unroll
+                for (int j = 0; j < kNumElemsPerRead; j += 2) {
+                    float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
+                    fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
+                }
+                scale_inv_lo = scale_inv;
+                scale_inv_hi = __shfl_sync(0xffffffff, scale_inv, 16);
+            }
+            __syncthreads();
+
+            if (copy_idx < Layout::kNumCopies) {
+                for (int k = copy_idx; k < num_topk; k += Layout::kNumCopies) {
+                    const auto dst_lo = reinterpret_cast<int4*>(shared_dst_lo[k]);
+                    const auto dst_hi = reinterpret_cast<int4*>(shared_dst_hi[k]);
+                    if (dst_lo == nullptr)
+                        continue;
+                    st_volatile_global_v4(unit_idx < Layout::kNumLoUnits ? dst_lo + unit_idx : dst_hi + (unit_idx - Layout::kNumLoUnits),
+                                          make_int4(fp8_value.x, flag, fp8_value.y, flag));
+                    if (lane_id == 0) {
+                        const int scale_unit_idx = Layout::kNumDataUnits + unit_idx / 32;
+                        st_volatile_global_v4(scale_unit_idx < Layout::kNumLoUnits ? dst_lo + scale_unit_idx
+                                                                                  : dst_hi + (scale_unit_idx - Layout::kNumLoUnits),
+                                              make_int4(__float_as_int(scale_inv_lo), flag, __float_as_int(scale_inv_hi), flag));
+                    }
+                    if (unit_idx == 0)
+                        st_volatile_global_v4(dst_hi + (Layout::kSrcUnit - Layout::kNumLoUnits), make_int4(token_idx, flag, 0, flag));
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+PAYLOAD_FLAGS_DISPATCH_RECV:
+    if ((phases & LEGACY_LOW_LATENCY_RECV_PHASE) == 0)
+        return;
+
+    // Each warp group packs the tokens one source rank sent to one local expert, at a begin fixed by the counts
+    if (responsible_expert_idx < num_experts) {
+        const int flag = payload_flags_value(shared_recv_seq);
+        const auto src_rank = responsible_expert_idx / num_local_experts;
+        const auto local_expert_idx = responsible_expert_idx % num_local_experts;
+        const auto num_slots_per_expert = num_ranks * num_max_dispatch_tokens_per_rank;
+        if (sub_warp_id == 0) {
+            int num_rank_tokens = 0;
+            if (lane_id < num_ranks) {
+                const auto count_ptr = reinterpret_cast<const int4*>(static_cast<const uint8_t*>(rdma_send_x) + num_hi_region_bytes) +
+                    local_expert_idx * num_ranks + lane_id;
+                auto start_time = clock64();
+                auto value = ld_volatile_global_v4(count_ptr);
+                while (value.y != flag or value.w != flag) {
+                    if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP payload-flags dispatch count timeout, rank %d, local_expert_idx %d, src_rank %d\n",
+                               rank, local_expert_idx, lane_id);
+                        trap();
+                    }
+                    value = ld_volatile_global_v4(count_ptr);
+                }
+                num_rank_tokens = value.x;
+            }
+            int recv_token_begin_idx = 0, num_total_tokens = 0;
+            for (int i = 0; i < num_ranks; ++i) {
+                const int num_tokens_of_rank = __shfl_sync(0xffffffff, num_rank_tokens, i);
+                recv_token_begin_idx += i < src_rank ? num_tokens_of_rank : 0;
+                num_total_tokens += num_tokens_of_rank;
+            }
+            const int num_recv_tokens = __shfl_sync(0xffffffff, num_rank_tokens, src_rank);
+            if (lane_id == 0) {
+                shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
+                shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
+                packed_recv_layout_range[local_expert_idx * num_ranks + src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
+                if (src_rank == 0)
+                    packed_recv_count[local_expert_idx] = num_total_tokens;
+                if (cumulative_local_expert_recv_stats != nullptr)
+                    atomicAdd(cumulative_local_expert_recv_stats + local_expert_idx, num_recv_tokens);
+            }
+        }
+        asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 1), "r"(num_warps_per_group * 32));
+        const int num_recv_tokens = shared_num_recv_tokens[warp_group_id];
+        const int recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
+
+        constexpr int kNumElemsPerPack = sizeof(packed_t) / sizeof(scale_t);
+        constexpr int kNumScales = kHidden / kNumPerChannels;
+        const auto num_aligned_tokens = align_up<int>(num_slots_per_expert, 128);
+        const auto num_aligned_scales = align_up<int>(kNumScales, sizeof(float) / sizeof(scale_t));
+        const auto recv_x_scales = static_cast<scale_t*>(packed_recv_x_scales) + local_expert_idx * num_aligned_tokens * num_aligned_scales;
+        const auto pack_stride = num_slots_per_expert * kNumElemsPerPack;
+        const auto recv_x_int2 = static_cast<int2*>(packed_recv_x) + static_cast<size_t>(local_expert_idx) * num_slots_per_expert * Layout::kNumDataUnits;
+        const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_slots_per_expert;
+        for (int i = sub_warp_id; i < num_recv_tokens; i += num_warps_per_group) {
+            const auto slot_offset =
+                ((static_cast<size_t>(local_expert_idx) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank + i) * Layout::kNumSlotBytes;
+            const auto src_lo = reinterpret_cast<const int4*>(static_cast<const uint8_t*>(rdma_recv_x) + slot_offset);
+            const auto src_hi = reinterpret_cast<const int4*>(static_cast<const uint8_t*>(rdma_send_x) + slot_offset);
+            const int token_idx = recv_token_begin_idx + i;
+            for (int unit_base = 0; unit_base < Layout::kNumUnits; unit_base += 32 * kPayloadFlagsDispatchRecvBatch) {
+                int4 list_value[kPayloadFlagsDispatchRecvBatch];
+                #pragma unroll
+                for (int j = 0; j < kPayloadFlagsDispatchRecvBatch; ++j) {
+                    const int unit = unit_base + j * 32 + lane_id;
+                    if (unit < Layout::kNumUnits)
+                        list_value[j] = ld_volatile_global_v4(unit < Layout::kNumLoUnits ? src_lo + unit : src_hi + (unit - Layout::kNumLoUnits));
+                }
+                #pragma unroll
+                for (int j = 0; j < kPayloadFlagsDispatchRecvBatch; ++j) {
+                    const int unit = unit_base + j * 32 + lane_id;
+                    if (unit >= Layout::kNumUnits)
+                        continue;
+                    auto start_time = clock64();
+                    while (list_value[j].y != flag or list_value[j].w != flag) {
+                        if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
+                            printf("DeepEP payload-flags dispatch timeout, rank %d, local_expert_idx %d, src_rank %d\n",
+                                   rank, local_expert_idx, src_rank);
+                            trap();
+                        }
+                        list_value[j] = ld_volatile_global_v4(unit < Layout::kNumLoUnits ? src_lo + unit : src_hi + (unit - Layout::kNumLoUnits));
+                    }
+                    if (unit < Layout::kNumDataUnits) {
+                        recv_x_int2[static_cast<size_t>(token_idx) * Layout::kNumDataUnits + unit] = make_int2(list_value[j].x, list_value[j].z);
+                    } else if (unit < Layout::kSrcUnit) {
+                        const int list_scale_bits[2] = {list_value[j].x, list_value[j].z};
+                        #pragma unroll
+                        for (int half = 0; half < 2; ++half) {
+                            const int scale_idx = (unit - Layout::kNumDataUnits) * 2 + half;
+                            const int pack_idx = scale_idx / kNumElemsPerPack;
+                            const int elem_idx = scale_idx % kNumElemsPerPack;
+                            recv_x_scales[token_idx * kNumElemsPerPack + pack_idx * pack_stride + elem_idx] =
+                                extract_required_scale_format<kUseUE8M0>(__int_as_float(list_scale_bits[half]));
+                        }
+                    } else {
+                        recv_src_info[token_idx] = list_value[j].x;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void dispatch_payload_flags(void* packed_recv_x,
+                            void* packed_recv_x_scales,
+                            int* packed_recv_src_info,
+                            int64_t* packed_recv_layout_range,
+                            int* packed_recv_count,
+                            int* cumulative_local_expert_recv_stats,
+                            void* rdma_recv_x,
+                            void* rdma_send_x,
+                            size_t num_region_bytes,
+                            const void* x,
+                            const topk_idx_t* topk_idx,
+                            int* next_clean,
+                            int num_next_clean_int,
+                            int num_tokens,
+                            int hidden,
+                            int num_max_dispatch_tokens_per_rank,
+                            int num_topk,
+                            int num_experts,
+                            int rank,
+                            int num_ranks,
+                            bool round_scale,
+                            bool use_ue8m0,
+                            void* workspace,
+                            int buffer_idx,
+                            int num_device_sms,
+                            cudaStream_t stream,
+                            int phases) {
+    const int num_warp_groups = ceil_div(num_experts, num_device_sms);
+    const int num_warps_per_group = 32 / num_warp_groups;
+    const int num_sms = ceil_div(num_experts, num_warp_groups);
+    EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 1 and num_sms <= kPayloadFlagsNumSeqSlots);
+    EP_HOST_ASSERT(num_topk <= kPayloadFlagsDispatchNumMaxTopk and num_topk <= num_warp_groups * num_warps_per_group);
+    EP_HOST_ASSERT(hidden % 256 == 0 and hidden <= 8192);
+    const size_t num_slot_bytes = ((hidden / 8 + hidden / 256 + 2) / 2) * sizeof(int4);
+    EP_HOST_ASSERT(static_cast<size_t>(num_experts) * num_max_dispatch_tokens_per_rank * num_slot_bytes + num_experts * sizeof(int4) <=
+                   num_region_bytes);
+    auto seq_counters = reinterpret_cast<int*>(static_cast<uint8_t*>(workspace) + kPayloadFlagsDispatchSeqOffsetBytes) +
+        buffer_idx * 2 * kPayloadFlagsNumSeqSlots;
+    EP_HOST_ASSERT(kPayloadFlagsDispatchSeqOffsetBytes + 4 * kPayloadFlagsNumSeqSlots * sizeof(int) <= LEGACY_NUM_WORKSPACE_BYTES);
+
+#define PAYLOAD_FLAGS_DISPATCH_LAUNCH_CASE(hidden)                                                                 \
+    {                                                                                                              \
+        EP_HOST_ASSERT(PayloadFlagsDispatchLayout<hidden>::kNumSlotBytes == num_slot_bytes);                       \
+        auto dispatch_func = use_ue8m0 ? dispatch_payload_flags<true, hidden> : dispatch_payload_flags<false, hidden>; \
+        LAUNCH_KERNEL(&cfg, dispatch_func,                                                                         \
+                      packed_recv_x, packed_recv_x_scales, packed_recv_src_info, packed_recv_layout_range,         \
+                      packed_recv_count, cumulative_local_expert_recv_stats, rdma_recv_x, rdma_send_x,             \
+                      x, topk_idx, next_clean, num_next_clean_int, seq_counters,                                   \
+                      num_tokens, num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks,        \
+                      num_warp_groups, num_warps_per_group, round_scale, phases);                                  \
+    }                                                                                                              \
+    break
+
+    SETUP_LAUNCH_CONFIG(num_sms, num_warp_groups * num_warps_per_group * 32, stream);
+    SWITCH_HIDDEN(PAYLOAD_FLAGS_DISPATCH_LAUNCH_CASE);
+#undef PAYLOAD_FLAGS_DISPATCH_LAUNCH_CASE
+}
+
 }  // namespace internode_ll
 
 }  // namespace deep_ep::legacy

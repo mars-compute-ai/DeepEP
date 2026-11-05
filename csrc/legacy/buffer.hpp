@@ -1472,8 +1472,11 @@ public:
                          bool use_ue8m0,
                          bool use_nvfp4,
                          bool async,
-                         bool return_recv_hook) {
+                         bool return_recv_hook,
+                         bool payload_flags = false) {
         EP_HOST_ASSERT(low_latency_mode);
+        EP_HOST_ASSERT(not payload_flags or (use_fp8 and not use_nvfp4 and mask_buffer_ptr == nullptr and
+                                             not dispatch_wait_recv_cost_stats.has_value()));
 
         // Tensor checks
         // By default using `ptp128c` FP8 cast
@@ -1503,8 +1506,11 @@ public:
         // Buffer control
         LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
         EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
+        const int dispatch_buffer_idx = low_latency_buffer_idx;
         auto buffer = layout.buffers[low_latency_buffer_idx];
         auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+        const size_t num_region_bytes =
+            static_cast<size_t>(num_experts) * num_max_dispatch_tokens_per_rank * buffer.num_bytes_per_combine_msg;
 
         // Wait previous tasks to be finished
         // NOTES: the hook mode will always use the default stream
@@ -1566,6 +1572,38 @@ public:
         // Kernel launch
         auto next_clean_meta = next_buffer.clean_meta();
         auto launcher = [=, this](int phases) {
+            if (payload_flags) {
+                internode_ll::dispatch_payload_flags(packed_recv_x.data_ptr(),
+                                                     packed_recv_x_scales_ptr,
+                                                     packed_recv_src_info.data_ptr<int>(),
+                                                     packed_recv_layout_range.data_ptr<int64_t>(),
+                                                     packed_recv_count.data_ptr<int>(),
+                                                     cumulative_local_expert_recv_stats.has_value()
+                                                         ? cumulative_local_expert_recv_stats->data_ptr<int>()
+                                                         : nullptr,
+                                                     buffer.dispatch_rdma_recv_data_buffer,
+                                                     buffer.dispatch_rdma_send_buffer,
+                                                     num_region_bytes,
+                                                     x.data_ptr(),
+                                                     topk_idx.data_ptr<topk_idx_t>(),
+                                                     next_clean_meta.first,
+                                                     next_clean_meta.second,
+                                                     num_tokens,
+                                                     hidden,
+                                                     num_max_dispatch_tokens_per_rank,
+                                                     num_topk,
+                                                     num_experts,
+                                                     rank,
+                                                     num_ranks,
+                                                     round_scale,
+                                                     use_ue8m0,
+                                                     workspace,
+                                                     dispatch_buffer_idx,
+                                                     num_device_sms,
+                                                     launch_stream,
+                                                     phases);
+                return;
+            }
             internode_ll::dispatch(
                 packed_recv_x.data_ptr(),
                 packed_recv_x_scales_ptr,
@@ -1599,7 +1637,9 @@ public:
                 launch_stream,
                 phases);
         };
-        launcher(return_recv_hook ? LEGACY_LOW_LATENCY_SEND_PHASE : (LEGACY_LOW_LATENCY_SEND_PHASE | LEGACY_LOW_LATENCY_RECV_PHASE));
+        // A payload-flags dispatch needs no fence between its phases, so both run in the first launch and the hook only orders
+        launcher(((return_recv_hook and not payload_flags) ? LEGACY_LOW_LATENCY_SEND_PHASE
+                                                                         : (LEGACY_LOW_LATENCY_SEND_PHASE | LEGACY_LOW_LATENCY_RECV_PHASE)));
 
         // Wait streams
         std::optional<EventHandle> event;
@@ -1613,7 +1653,9 @@ public:
 
         // Receiver callback
         std::optional<std::function<void()>> recv_hook = std::nullopt;
-        if (return_recv_hook)
+        if (return_recv_hook and payload_flags)
+            recv_hook = []() {};
+        else if (return_recv_hook)
             recv_hook = [=]() { launcher(LEGACY_LOW_LATENCY_RECV_PHASE); };
 
         // Return values

@@ -343,6 +343,34 @@ void combine_payload_flags(void* combined_x,
                            cudaStream_t stream,
                            int phases);
 
+void dispatch_payload_flags(void* packed_recv_x,
+                            void* packed_recv_x_scales,
+                            int* packed_recv_src_info,
+                            int64_t* packed_recv_layout_range,
+                            int* packed_recv_count,
+                            int* cumulative_local_expert_recv_stats,
+                            void* rdma_recv_x,
+                            void* rdma_send_x,
+                            size_t num_region_bytes,
+                            const void* x,
+                            const topk_idx_t* topk_idx,
+                            int* next_clean,
+                            int num_next_clean_int,
+                            int num_tokens,
+                            int hidden,
+                            int num_max_dispatch_tokens_per_rank,
+                            int num_topk,
+                            int num_experts,
+                            int rank,
+                            int num_ranks,
+                            bool round_scale,
+                            bool use_ue8m0,
+                            void* workspace,
+                            int buffer_idx,
+                            int num_device_sms,
+                            cudaStream_t stream,
+                            int phases);
+
 void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, cudaStream_t stream);
 
 void update_mask_buffer(int* mask_buffer_ptr, int rank_to_mask, bool mask, cudaStream_t stream);
