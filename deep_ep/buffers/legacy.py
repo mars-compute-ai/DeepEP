@@ -558,7 +558,7 @@ class Buffer:
                              use_fp8: bool = True, round_scale: bool = False, use_ue8m0: bool = False,
                              use_nvfp4: bool = False,
                              async_finish: bool = False, return_recv_hook: bool = False,
-                             payload_flags: bool = False) -> \
+                             payload_flags: bool = False, payload_flags_unit_recv: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         A low-latency implementation for dispatching with IBGDA.
@@ -593,6 +593,8 @@ class Buffer:
                 peers' buffers over NVLink, with the per-expert counts flagged the same way, so no system-scope release,
                 count wait or grid sync is needed and both phases run in the first launch (the hook is then a no-op);
                 FP8 over NVLink P2P to every rank only, without rank masking or wait-cost stats.
+            payload_flags_unit_recv: with `payload_flags`, every thread of a receiving warp group polls its own
+                (token, unit) items, a batch at once, reloading only the pending ones.
 
         Returns:
             recv_x: a tensor or tuple with received tokens for each expert.
@@ -629,7 +631,7 @@ class Buffer:
                                               use_fp8, round_scale, use_ue8m0,
                                               use_nvfp4,
                                               async_finish, return_recv_hook,
-                                              payload_flags)
+                                              payload_flags, payload_flags_unit_recv)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx,
                              packed_recv_x, packed_recv_x_scales, packed_recv_count,

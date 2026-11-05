@@ -2329,6 +2329,7 @@ void combine_payload_flags(void* combined_x,
 constexpr size_t kPayloadFlagsDispatchSeqOffsetBytes = kPayloadFlagsSeqOffsetBytes + 4 * kPayloadFlagsNumSeqSlots * sizeof(int);
 constexpr int kPayloadFlagsDispatchNumMaxTopk = 16;
 constexpr int kPayloadFlagsDispatchRecvBatch = 6;
+constexpr int kPayloadFlagsDispatchUnitRecvBatch = 4;
 
 template <int kHidden>
 struct PayloadFlagsDispatchLayout {
@@ -2352,7 +2353,7 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
                        int num_tokens, int num_max_dispatch_tokens_per_rank, int num_topk,
                        int num_experts, int rank, int num_ranks,
                        int num_warp_groups, int num_warps_per_group,
-                       bool round_scale, int phases) {
+                       bool round_scale, int phases, bool unit_recv) {
     using Layout = PayloadFlagsDispatchLayout<kHidden>;
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
     using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
@@ -2567,6 +2568,83 @@ PAYLOAD_FLAGS_DISPATCH_RECV:
         const auto pack_stride = num_slots_per_expert * kNumElemsPerPack;
         const auto recv_x_int2 = static_cast<int2*>(packed_recv_x) + static_cast<size_t>(local_expert_idx) * num_slots_per_expert * Layout::kNumDataUnits;
         const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_slots_per_expert;
+
+        // Unit receive: the warp group's threads take the (token, unit) items in turn, each polling a batch of units
+        // at once and reloading only the pending ones, so a unit's wait never queues behind another's
+        if (unit_recv) {
+            const int thread_in_group = sub_warp_id * 32 + lane_id;
+            const int num_group_threads = num_warps_per_group * 32;
+            const int num_items = num_recv_tokens * Layout::kNumUnits;
+            const auto store_unit = [&](const int item, const int4& value) {
+                const int token_idx = recv_token_begin_idx + item / Layout::kNumUnits;
+                const int unit = item % Layout::kNumUnits;
+                if (unit < Layout::kNumDataUnits) {
+                    recv_x_int2[static_cast<size_t>(token_idx) * Layout::kNumDataUnits + unit] = make_int2(value.x, value.z);
+                } else if (unit < Layout::kSrcUnit) {
+                    const int list_scale_bits[2] = {value.x, value.z};
+                    #pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        const int scale_idx = (unit - Layout::kNumDataUnits) * 2 + half;
+                        const int pack_idx = scale_idx / kNumElemsPerPack;
+                        const int elem_idx = scale_idx % kNumElemsPerPack;
+                        recv_x_scales[token_idx * kNumElemsPerPack + pack_idx * pack_stride + elem_idx] =
+                            extract_required_scale_format<kUseUE8M0>(__int_as_float(list_scale_bits[half]));
+                    }
+                } else {
+                    recv_src_info[token_idx] = value.x;
+                }
+            };
+            for (int item_base = 0; item_base < num_items; item_base += num_group_threads * kPayloadFlagsDispatchUnitRecvBatch) {
+                int4 list_value[kPayloadFlagsDispatchUnitRecvBatch];
+                const int4* list_src[kPayloadFlagsDispatchUnitRecvBatch];
+                bool list_pending[kPayloadFlagsDispatchUnitRecvBatch];
+                #pragma unroll
+                for (int j = 0; j < kPayloadFlagsDispatchUnitRecvBatch; ++j) {
+                    const int item = item_base + j * num_group_threads + thread_in_group;
+                    list_pending[j] = item < num_items;
+                    list_src[j] = nullptr;
+                    if (list_pending[j]) {
+                        const int unit = item % Layout::kNumUnits;
+                        const auto slot_offset =
+                            ((static_cast<size_t>(local_expert_idx) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank +
+                             item / Layout::kNumUnits) * Layout::kNumSlotBytes;
+                        list_src[j] = unit < Layout::kNumLoUnits
+                            ? reinterpret_cast<const int4*>(static_cast<const uint8_t*>(rdma_recv_x) + slot_offset) + unit
+                            : reinterpret_cast<const int4*>(static_cast<const uint8_t*>(rdma_send_x) + slot_offset) + (unit - Layout::kNumLoUnits);
+                        list_value[j] = ld_volatile_global_v4(list_src[j]);
+                    }
+                }
+                auto start_time = clock64();
+                while (true) {
+                    bool is_any_pending = false;
+                    #pragma unroll
+                    for (int j = 0; j < kPayloadFlagsDispatchUnitRecvBatch; ++j) {
+                        if (not list_pending[j])
+                            continue;
+                        if (list_value[j].y == flag and list_value[j].w == flag) {
+                            store_unit(item_base + j * num_group_threads + thread_in_group, list_value[j]);
+                            list_pending[j] = false;
+                        } else {
+                            is_any_pending = true;
+                        }
+                    }
+                    if (not is_any_pending)
+                        break;
+                    if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP payload-flags unit dispatch timeout, rank %d, local_expert_idx %d, src_rank %d\n",
+                               rank, local_expert_idx, src_rank);
+                        trap();
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < kPayloadFlagsDispatchUnitRecvBatch; ++j) {
+                        if (list_pending[j])
+                            list_value[j] = ld_volatile_global_v4(list_src[j]);
+                    }
+                }
+            }
+            return;
+        }
+
         for (int i = sub_warp_id; i < num_recv_tokens; i += num_warps_per_group) {
             const auto slot_offset =
                 ((static_cast<size_t>(local_expert_idx) * num_ranks + src_rank) * num_max_dispatch_tokens_per_rank + i) * Layout::kNumSlotBytes;
@@ -2642,7 +2720,8 @@ void dispatch_payload_flags(void* packed_recv_x,
                             int buffer_idx,
                             int num_device_sms,
                             cudaStream_t stream,
-                            int phases) {
+                            int phases,
+                            bool unit_recv) {
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
     const int num_sms = ceil_div(num_experts, num_warp_groups);
@@ -2665,7 +2744,7 @@ void dispatch_payload_flags(void* packed_recv_x,
                       packed_recv_count, cumulative_local_expert_recv_stats, rdma_recv_x, rdma_send_x,             \
                       x, topk_idx, next_clean, num_next_clean_int, seq_counters,                                   \
                       num_tokens, num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks,        \
-                      num_warp_groups, num_warps_per_group, round_scale, phases);                                  \
+                      num_warp_groups, num_warps_per_group, round_scale, phases, unit_recv);                       \
     }                                                                                                              \
     break
 
