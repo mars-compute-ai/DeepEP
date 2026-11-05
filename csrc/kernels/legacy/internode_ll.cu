@@ -2036,7 +2036,7 @@ combine_payload_flags(void* combined_x,
                       int num_max_dispatch_tokens_per_rank,
                       int num_experts, int rank, int num_ranks,
                       int num_warp_groups, int num_warps_per_group,
-                      int phases, bool cta_clean) {
+                      int phases, bool cta_clean, bool tile_recv) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -2146,6 +2146,69 @@ PAYLOAD_FLAGS_RECV:
     if ((phases & LEGACY_LOW_LATENCY_RECV_PHASE) == 0)
         return;
 
+    // Tile receive: a CTA per (token, 128 units), a thread per (top-k slot, unit) polling one unit, sum over the slots
+    if (tile_recv) {
+        constexpr int kTileUnits = 128;
+        constexpr int kTileTopk = 8;
+        constexpr int kNumTiles = kNumUnits / kTileUnits;
+        EP_STATIC_ASSERT(kNumUnits % kTileUnits == 0, "Hidden must split into 128-unit tiles");
+        __shared__ int2 shared_tile_data[kTileTopk][kTileUnits];
+        __shared__ float shared_tile_weight[kTileTopk];
+        const int flag = payload_flags_value(shared_recv_seq);
+        const int topk_slot = thread_id / kTileUnits;
+        const int unit_in_tile = thread_id % kTileUnits;
+        for (int tile = sm_id; tile < num_combined_tokens * kNumTiles; tile += num_sms) {
+            const int token_idx = tile / kNumTiles;
+            const int unit = (tile % kNumTiles) * kTileUnits + unit_in_tile;
+            int2 data = make_int2(0, 0);
+            float weight = 0.0f;
+            const int expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + topk_slot));
+            if (expert_idx >= 0) {
+                weight = __ldg(topk_weights + token_idx * num_topk + topk_slot);
+                const auto recv_base = static_cast<const uint8_t*>(unit < kNumHalfUnits ? rdma_recv_x : rdma_send_x);
+                const auto ptr = reinterpret_cast<const int4*>(
+                    recv_base + (static_cast<uint64_t>(expert_idx) * num_max_dispatch_tokens_per_rank + token_idx) * kNumBytesPerSlot) +
+                    (unit % kNumHalfUnits);
+                auto value = ld_volatile_global_v4(ptr);
+                auto start_time = clock64();
+                while (value.y != flag or value.w != flag) {
+                    if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP payload-flags tile combine timeout, rank %d, token %d\n", rank, token_idx);
+                        trap();
+                    }
+                    value = ld_volatile_global_v4(ptr);
+                }
+                data = make_int2(value.x, value.z);
+            }
+            shared_tile_data[topk_slot][unit_in_tile] = data;
+            if (unit_in_tile == 0)
+                shared_tile_weight[topk_slot] = weight;
+            __syncthreads();
+            if (topk_slot == 0) {
+                float combined_values[kNumElemsPerUnit] = {0.0f};
+                #pragma unroll
+                for (int k = 0; k < kTileTopk; ++k) {
+                    const int2 slot_data = shared_tile_data[k][unit_in_tile];
+                    const float slot_weight = shared_tile_weight[k];
+                    const int list_data[2] = {slot_data.x, slot_data.y};
+                    #pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        const auto pair = *reinterpret_cast<const nv_bfloat162*>(&list_data[j]);
+                        combined_values[j * 2] += static_cast<float>(pair.x) * slot_weight;
+                        combined_values[j * 2 + 1] += static_cast<float>(pair.y) * slot_weight;
+                    }
+                }
+                int2 out;
+                auto out_bf16 = reinterpret_cast<nv_bfloat162*>(&out);
+                out_bf16[0] = __floats2bfloat162_rn(combined_values[0], combined_values[1]);
+                out_bf16[1] = __floats2bfloat162_rn(combined_values[2], combined_values[3]);
+                reinterpret_cast<int2*>(combined_x)[static_cast<int64_t>(token_idx) * kNumUnits + unit] = out;
+            }
+            __syncthreads();
+        }
+        return;
+    }
+
     // Each thread reduces one unit (4 BF16) of a token's hidden over its top-k slots, polling each unit's flags
     {
         constexpr int kThreadsPerToken = kNumUnits < 1024 ? kNumUnits : 1024;
@@ -2233,7 +2296,8 @@ void combine_payload_flags(void* combined_x,
                            int num_device_sms,
                            cudaStream_t stream,
                            int phases,
-                           bool cta_clean) {
+                           bool cta_clean,
+                           bool tile_recv) {
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
     const int num_sms = ceil_div(num_experts, num_warp_groups);
@@ -2241,6 +2305,7 @@ void combine_payload_flags(void* combined_x,
     auto atomic_clean_flag = static_cast<int*>(workspace);
     auto seq_counters = reinterpret_cast<int*>(static_cast<uint8_t*>(workspace) + kPayloadFlagsSeqOffsetBytes) +
         buffer_idx * 2 * kPayloadFlagsNumSeqSlots;
+    EP_HOST_ASSERT(not tile_recv or (num_topk == 8 and num_warp_groups * num_warps_per_group * 32 == 1024));
     EP_HOST_ASSERT(kPayloadFlagsSeqOffsetBytes + 4 * kPayloadFlagsNumSeqSlots * sizeof(int) <= LEGACY_NUM_WORKSPACE_BYTES);
 
     cudaLaunchConfig_t cfg = {static_cast<unsigned int>(num_sms), static_cast<unsigned int>(num_warp_groups * num_warps_per_group * 32), 0, stream, nullptr, 0};
@@ -2251,7 +2316,7 @@ void combine_payload_flags(void* combined_x,
                       src_info, layout_range, next_clean, num_next_clean_int,                         \
                       atomic_clean_flag, seq_counters, num_combined_tokens, num_topk,                 \
                       num_max_dispatch_tokens_per_rank, num_experts, rank, num_ranks,                 \
-                      num_warp_groups, num_warps_per_group, phases, cta_clean);                       \
+                      num_warp_groups, num_warps_per_group, phases, cta_clean, tile_recv);            \
     }                                                                                                 \
     break
     SWITCH_HIDDEN(PAYLOAD_FLAGS_COMBINE_LAUNCH_CASE);

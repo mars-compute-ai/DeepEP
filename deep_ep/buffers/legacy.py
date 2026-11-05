@@ -647,7 +647,8 @@ class Buffer:
                             return_recv_hook: bool = False, out: Optional[torch.Tensor] = None,
                             combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
                             overlap: bool = False, src_signals: Optional[torch.Tensor] = None, src_signal_expect_value: int = 0,
-                            payload_flags: bool = False, payload_flags_cta_clean: bool = False) -> \
+                            payload_flags: bool = False, payload_flags_cta_clean: bool = False,
+                            payload_flags_tile_recv: bool = False) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
@@ -678,6 +679,8 @@ class Buffer:
                 are needed; NVLink P2P to every rank only, without LogFMT, zero-copy, overlap or rank masking.
             payload_flags_cta_clean: with `payload_flags`, every SM clears the next buffer's signals and fences before
                 its own sends, instead of all senders waiting for SM 0's clean through a shared flag.
+            payload_flags_tile_recv: with `payload_flags`, receive in tiles of (token, 128 units): every thread polls one
+                top-k unit and the slots are summed through shared memory in top-k order (top-k 8 only).
             combine_wait_recv_cost_stats: a cumulative time spent waiting to receive each token tensor for statistics,
                 which should have shape `[num_ranks, num_ranks]` and be typed as `torch.int64`.
                 This is useful for detecting and precisely localizing slow anomalies.
@@ -697,7 +700,8 @@ class Buffer:
                                                                    use_logfmt, zero_copy, async_finish, return_recv_hook,
                                                                    out,
                                                                    overlap, src_signals, src_signal_expect_value,
-                                                                   payload_flags, payload_flags_cta_clean)
+                                                                   payload_flags, payload_flags_cta_clean,
+                                                                   payload_flags_tile_recv)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
         return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
 

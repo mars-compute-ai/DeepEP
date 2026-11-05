@@ -342,7 +342,8 @@ void combine_payload_flags(void* combined_x,
                            int num_device_sms,
                            cudaStream_t stream,
                            int phases,
-                           bool cta_clean);
+                           bool cta_clean,
+                           bool tile_recv);
 
 void dispatch_payload_flags(void* packed_recv_x,
                             void* packed_recv_x_scales,
