@@ -1684,8 +1684,10 @@ public:
         uint32_t src_signal_expect_value = 0,
         bool payload_flags = false,
         bool payload_flags_cta_clean = false,
-        bool payload_flags_tile_recv = false) {
+        bool payload_flags_tile_recv = false,
+        bool payload_flags_fast_send = false) {
         EP_HOST_ASSERT(low_latency_mode);
+        EP_HOST_ASSERT(payload_flags_cta_clean or not payload_flags_fast_send);
         EP_HOST_ASSERT(not payload_flags or (not use_logfmt and not zero_copy and not overlap and mask_buffer_ptr == nullptr));
         EP_HOST_ASSERT(payload_flags or not payload_flags_cta_clean);
         EP_HOST_ASSERT(payload_flags or not payload_flags_tile_recv);
@@ -1770,7 +1772,8 @@ public:
                                                     launch_stream,
                                                     phases,
                                                     payload_flags_cta_clean,
-                                                    payload_flags_tile_recv);
+                                                    payload_flags_tile_recv,
+                                                    payload_flags_fast_send);
                 return;
             }
             internode_ll::combine(combined_x.data_ptr(),

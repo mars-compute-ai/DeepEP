@@ -2036,7 +2036,7 @@ combine_payload_flags(void* combined_x,
                       int num_max_dispatch_tokens_per_rank,
                       int num_experts, int rank, int num_ranks,
                       int num_warp_groups, int num_warps_per_group,
-                      int phases, bool cta_clean, bool tile_recv) {
+                      int phases, bool cta_clean, bool tile_recv, bool fast_send) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -2056,6 +2056,18 @@ combine_payload_flags(void* combined_x,
     constexpr size_t kNumBytesPerSlot = kHidden * sizeof(nv_bfloat16) + kHidden / 128 * sizeof(nv_bfloat162);
     EP_STATIC_ASSERT(kNumHalfUnits * sizeof(int4) <= kNumBytesPerSlot, "Half message exceeds a slot");
 
+    // Fast send: the next buffer's signals and this group's layout are read in the same round trip as the sequence,
+    // and the signals are cleared (with their fence) only when a shipped kernel left one set
+    int is_next_dirty = 0;
+    int64_t prefetched_layout = 0;
+    if (fast_send and (phases & LEGACY_LOW_LATENCY_SEND_PHASE)) {
+        for (int i = thread_id; i < num_next_clean_int; i += blockDim.x)
+            is_next_dirty |= ld_volatile_global(next_clean + i) != 0;
+        if (responsible_expert_idx < num_experts)
+            prefetched_layout = __ldg(layout_range + (responsible_expert_idx % num_local_experts) * num_ranks +
+                                      responsible_expert_idx / num_local_experts);
+    }
+
     __shared__ int shared_seq;
     __shared__ int shared_recv_seq;
     if (thread_id == 0) {
@@ -2064,7 +2076,10 @@ combine_payload_flags(void* combined_x,
         if (phases & LEGACY_LOW_LATENCY_RECV_PHASE)
             shared_recv_seq = seq_counters[kPayloadFlagsNumSeqSlots + sm_id] + 1;
     }
-    __syncthreads();
+    if (fast_send)
+        is_next_dirty = __syncthreads_or(is_next_dirty);
+    else
+        __syncthreads();
     if (thread_id == 0) {
         if (phases & LEGACY_LOW_LATENCY_SEND_PHASE)
             seq_counters[sm_id] = shared_seq;
@@ -2084,7 +2099,15 @@ combine_payload_flags(void* combined_x,
         goto PAYLOAD_FLAGS_RECV;
 
     // Clean the next buffer's signals before any peer can see this call's data
-    if (cta_clean) {
+    if (fast_send) {
+        if (is_next_dirty) {
+            for (int i = thread_id; i < num_next_clean_int; i += blockDim.x) {
+                next_clean[i] = 0;
+                __threadfence();
+            }
+            __syncthreads();
+        }
+    } else if (cta_clean) {
         for (int i = thread_id; i < num_next_clean_int; i += blockDim.x) {
             next_clean[i] = 0;
             __threadfence();
@@ -2104,9 +2127,11 @@ combine_payload_flags(void* combined_x,
         const auto dst_rank = responsible_expert_idx / num_local_experts;
         const auto local_expert_idx = responsible_expert_idx % num_local_experts;
         const auto global_expert_idx = rank * num_local_experts + local_expert_idx;
-        const auto layout = __ldg(layout_range + local_expert_idx * num_ranks + dst_rank);
+        const auto layout = fast_send ? prefetched_layout : __ldg(layout_range + local_expert_idx * num_ranks + dst_rank);
         const auto local_x =
             static_cast<const int4*>(x) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * kHiddenInt4;
+        const auto dst_lo_base = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank);
+        const auto dst_hi_base = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_send_x), rank, dst_rank);
         const auto local_src_info = src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
         const int flag = payload_flags_value(shared_seq);
         int offset, num_tokens_to_send;
@@ -2123,8 +2148,10 @@ combine_payload_flags(void* combined_x,
             const int chunk_idx = item % kNumChunks;
             const auto src_idx = __ldg(local_src_info + token_idx);
             const auto slot_offset = (static_cast<uint64_t>(global_expert_idx) * num_max_dispatch_tokens_per_rank + src_idx) * kNumBytesPerSlot;
-            const auto dst_lo = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x) + slot_offset, rank, dst_rank);
-            const auto dst_hi = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_send_x) + slot_offset, rank, dst_rank);
+            const auto dst_lo = fast_send ? dst_lo_base + slot_offset
+                                          : nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x) + slot_offset, rank, dst_rank);
+            const auto dst_hi = fast_send ? dst_hi_base + slot_offset
+                                          : nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_send_x) + slot_offset, rank, dst_rank);
             EP_DEVICE_ASSERT(dst_lo != 0 and dst_hi != 0);
             const auto x_int2 = reinterpret_cast<const int2*>(local_x + token_idx * kHiddenInt4);
             const int chunk_end = min(kNumUnits, (chunk_idx + 1) * kChunkUnits);
@@ -2297,7 +2324,8 @@ void combine_payload_flags(void* combined_x,
                            cudaStream_t stream,
                            int phases,
                            bool cta_clean,
-                           bool tile_recv) {
+                           bool tile_recv,
+                           bool fast_send) {
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
     const int num_sms = ceil_div(num_experts, num_warp_groups);
@@ -2306,6 +2334,7 @@ void combine_payload_flags(void* combined_x,
     auto seq_counters = reinterpret_cast<int*>(static_cast<uint8_t*>(workspace) + kPayloadFlagsSeqOffsetBytes) +
         buffer_idx * 2 * kPayloadFlagsNumSeqSlots;
     EP_HOST_ASSERT(not tile_recv or (num_topk == 8 and num_warp_groups * num_warps_per_group * 32 == 1024));
+    EP_HOST_ASSERT(not fast_send or cta_clean);
     EP_HOST_ASSERT(kPayloadFlagsSeqOffsetBytes + 4 * kPayloadFlagsNumSeqSlots * sizeof(int) <= LEGACY_NUM_WORKSPACE_BYTES);
 
     cudaLaunchConfig_t cfg = {static_cast<unsigned int>(num_sms), static_cast<unsigned int>(num_warp_groups * num_warps_per_group * 32), 0, stream, nullptr, 0};
@@ -2316,7 +2345,7 @@ void combine_payload_flags(void* combined_x,
                       src_info, layout_range, next_clean, num_next_clean_int,                         \
                       atomic_clean_flag, seq_counters, num_combined_tokens, num_topk,                 \
                       num_max_dispatch_tokens_per_rank, num_experts, rank, num_ranks,                 \
-                      num_warp_groups, num_warps_per_group, phases, cta_clean, tile_recv);            \
+                      num_warp_groups, num_warps_per_group, phases, cta_clean, tile_recv, fast_send); \
     }                                                                                                 \
     break
     SWITCH_HIDDEN(PAYLOAD_FLAGS_COMBINE_LAUNCH_CASE);
