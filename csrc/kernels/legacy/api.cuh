@@ -373,7 +373,8 @@ void dispatch_payload_flags(void* packed_recv_x,
                             int num_device_sms,
                             cudaStream_t stream,
                             int phases,
-                            bool unit_recv);
+                            bool unit_recv,
+                            bool fast_send);
 
 void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, cudaStream_t stream);
 

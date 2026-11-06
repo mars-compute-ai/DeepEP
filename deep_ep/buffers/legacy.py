@@ -558,7 +558,8 @@ class Buffer:
                              use_fp8: bool = True, round_scale: bool = False, use_ue8m0: bool = False,
                              use_nvfp4: bool = False,
                              async_finish: bool = False, return_recv_hook: bool = False,
-                             payload_flags: bool = False, payload_flags_unit_recv: bool = False) -> \
+                             payload_flags: bool = False, payload_flags_unit_recv: bool = False,
+                             payload_flags_fast_send: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         A low-latency implementation for dispatching with IBGDA.
@@ -595,6 +596,8 @@ class Buffer:
                 FP8 over NVLink P2P to every rank only, without rank masking or wait-cost stats.
             payload_flags_unit_recv: with `payload_flags`, every thread of a receiving warp group polls its own
                 (token, unit) items, a batch at once, reloading only the pending ones.
+            payload_flags_fast_send: with `payload_flags`, the counting warp reads its share of the next buffer's signals
+                in the sequence's round trip and clears it (and fences) before the counts only when one is set.
 
         Returns:
             recv_x: a tensor or tuple with received tokens for each expert.
@@ -631,7 +634,7 @@ class Buffer:
                                               use_fp8, round_scale, use_ue8m0,
                                               use_nvfp4,
                                               async_finish, return_recv_hook,
-                                              payload_flags, payload_flags_unit_recv)
+                                              payload_flags, payload_flags_unit_recv, payload_flags_fast_send)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx,
                              packed_recv_x, packed_recv_x_scales, packed_recv_count,

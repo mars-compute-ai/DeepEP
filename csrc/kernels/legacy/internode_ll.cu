@@ -2382,7 +2382,7 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
                        int num_tokens, int num_max_dispatch_tokens_per_rank, int num_topk,
                        int num_experts, int rank, int num_ranks,
                        int num_warp_groups, int num_warps_per_group,
-                       bool round_scale, int phases, bool unit_recv) {
+                       bool round_scale, int phases, bool unit_recv, bool fast_send) {
     using Layout = PayloadFlagsDispatchLayout<kHidden>;
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
     using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
@@ -2409,6 +2409,19 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
     __shared__ uint64_t shared_dst_hi[kPayloadFlagsDispatchNumMaxTopk];
     __shared__ int shared_num_recv_tokens[kNumMaxWarpGroups];
     __shared__ int shared_recv_token_begin_idx[kNumMaxWarpGroups];
+
+    // Fast send: the counting warp reads its share of the next buffer's signals in the sequence's round trip, and
+    // clears it (with its fence) only when a shipped kernel left one set
+    const int num_clean_per_sm = ceil_div(num_next_clean_int, num_sms);
+    const int clean_end = min(num_next_clean_int, (sm_id + 1) * num_clean_per_sm);
+    bool is_next_dirty = false;
+    if (fast_send and (phases & LEGACY_LOW_LATENCY_SEND_PHASE) and warp_id == num_warps - 1) {
+        int is_lane_dirty = 0;
+        for (int i = sm_id * num_clean_per_sm + lane_id; i < clean_end; i += 32)
+            is_lane_dirty |= ld_volatile_global(next_clean + i) != 0;
+        is_next_dirty = __any_sync(0xffffffff, is_lane_dirty);
+    }
+
     if (thread_id == 0) {
         if (phases & LEGACY_LOW_LATENCY_SEND_PHASE)
             shared_seq = seq_counters[sm_id] + 1;
@@ -2442,12 +2455,12 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
         if (warp_id == num_warps - 1) {
             const auto expert_begin_idx = sm_id * num_warp_groups;
             const auto expert_end_idx = min(expert_begin_idx + num_warp_groups, num_experts);
-            const int num_clean_per_sm = ceil_div(num_next_clean_int, num_sms);
-            const int clean_end = min(num_next_clean_int, (sm_id + 1) * num_clean_per_sm);
-            for (int i = sm_id * num_clean_per_sm + lane_id; i < clean_end; i += 32)
-                next_clean[i] = 0;
-            __syncwarp();
-            __threadfence();
+            if (not fast_send or is_next_dirty) {
+                for (int i = sm_id * num_clean_per_sm + lane_id; i < clean_end; i += 32)
+                    next_clean[i] = 0;
+                __syncwarp();
+                __threadfence();
+            }
             for (int expert_idx = expert_begin_idx; expert_idx < expert_end_idx; ++expert_idx) {
                 int count = 0;
                 for (int i = lane_id; i < num_tokens * num_topk; i += 32)
@@ -2750,7 +2763,8 @@ void dispatch_payload_flags(void* packed_recv_x,
                             int num_device_sms,
                             cudaStream_t stream,
                             int phases,
-                            bool unit_recv) {
+                            bool unit_recv,
+                            bool fast_send) {
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
     const int num_sms = ceil_div(num_experts, num_warp_groups);
@@ -2773,7 +2787,7 @@ void dispatch_payload_flags(void* packed_recv_x,
                       packed_recv_count, cumulative_local_expert_recv_stats, rdma_recv_x, rdma_send_x,             \
                       x, topk_idx, next_clean, num_next_clean_int, seq_counters,                                   \
                       num_tokens, num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks,        \
-                      num_warp_groups, num_warps_per_group, round_scale, phases, unit_recv);                       \
+                      num_warp_groups, num_warps_per_group, round_scale, phases, unit_recv, fast_send);            \
     }                                                                                                              \
     break
 
