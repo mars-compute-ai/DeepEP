@@ -2382,7 +2382,7 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
                        int num_tokens, int num_max_dispatch_tokens_per_rank, int num_topk,
                        int num_experts, int rank, int num_ranks,
                        int num_warp_groups, int num_warps_per_group,
-                       bool round_scale, int phases, bool unit_recv, bool fast_send, bool split_send) {
+                       bool round_scale, int phases, bool unit_recv, bool fast_send) {
     using Layout = PayloadFlagsDispatchLayout<kHidden>;
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
     using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
@@ -2481,87 +2481,6 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
         // Cast each token and write its flagged units into every top-k peer slot
         const int copy_idx = thread_id / Layout::kNumDataUnits;
         const int unit_idx = thread_id % Layout::kNumDataUnits;
-
-        // Split send: each copy group of a CTA takes one (token, top-k slot) item, item = sm_id + copy * num_sms,
-        // so the copies of a token leave from as many SMs as there are items
-        if (split_send) {
-            constexpr int kNumWarpsPerCopy = Layout::kNumDataUnits / 32;
-            const int num_items = num_tokens * num_topk;
-            for (int item_base = sm_id; item_base < num_items; item_base += num_sms * Layout::kNumCopies) {
-                const int item = item_base + copy_idx * num_sms;
-                const bool is_valid_item = copy_idx < Layout::kNumCopies and item < num_items;
-                const int token_idx = item / num_topk;
-                if (is_valid_item and warp_id % kNumWarpsPerCopy == 0) {
-                    const int dst_expert_idx = static_cast<int>(__ldg(topk_idx + item));
-                    int slot_idx = 0;
-                    if (dst_expert_idx >= 0) {
-                        for (int i = lane_id; i < token_idx * num_topk; i += 32)
-                            slot_idx += static_cast<int>(__ldg(topk_idx + i)) == dst_expert_idx;
-                        slot_idx = warp_reduce_sum(slot_idx);
-                    }
-                    if (lane_id == 0) {
-                        uint64_t dst_lo = 0, dst_hi = 0;
-                        if (dst_expert_idx >= 0) {
-                            const auto dst_rank = dst_expert_idx / num_local_experts;
-                            const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
-                            const auto slot_offset =
-                                ((static_cast<size_t>(dst_expert_local_idx) * num_ranks + rank) * num_max_dispatch_tokens_per_rank + slot_idx) *
-                                Layout::kNumSlotBytes;
-                            dst_lo = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x) + slot_offset, rank, dst_rank);
-                            dst_hi = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_send_x) + slot_offset, rank, dst_rank);
-                            EP_DEVICE_ASSERT(dst_lo != 0 and dst_hi != 0);
-                        }
-                        shared_dst_lo[copy_idx] = dst_lo;
-                        shared_dst_hi[copy_idx] = dst_hi;
-                    }
-                }
-
-                int2 fp8_value = {0, 0};
-                float scale_inv_lo = 0.0f, scale_inv_hi = 0.0f;
-                if (is_valid_item) {
-                    auto int4_value = __ldg(static_cast<const int4*>(x) + static_cast<size_t>(token_idx) * Layout::kNumDataUnits + unit_idx);
-                    auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
-                    float fp32_values[kNumElemsPerRead];
-                    float amax = kFP8Margin, scale, scale_inv;
-                    #pragma unroll
-                    for (int j = 0; j < kNumElemsPerRead; ++j) {
-                        fp32_values[j] = static_cast<float>(bf16_values[j]);
-                        amax = fmaxf(amax, fabsf(fp32_values[j]));
-                    }
-                    amax = warp_reduce_max<16>(amax);
-                    calculate_fp8_scales(amax, scale, scale_inv, round_scale);
-                    auto fp8x2_values = reinterpret_cast<__nv_fp8x2_storage_t*>(&fp8_value);
-                    #pragma unroll
-                    for (int j = 0; j < kNumElemsPerRead; j += 2) {
-                        float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
-                        fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
-                    }
-                    scale_inv_lo = scale_inv;
-                    scale_inv_hi = __shfl_sync(0xffffffff, scale_inv, 16);
-                }
-                __syncthreads();
-
-                if (is_valid_item) {
-                    const auto dst_lo = reinterpret_cast<int4*>(shared_dst_lo[copy_idx]);
-                    const auto dst_hi = reinterpret_cast<int4*>(shared_dst_hi[copy_idx]);
-                    if (dst_lo != nullptr) {
-                        st_volatile_global_v4(unit_idx < Layout::kNumLoUnits ? dst_lo + unit_idx : dst_hi + (unit_idx - Layout::kNumLoUnits),
-                                              make_int4(fp8_value.x, flag, fp8_value.y, flag));
-                        if (lane_id == 0) {
-                            const int scale_unit_idx = Layout::kNumDataUnits + unit_idx / 32;
-                            st_volatile_global_v4(scale_unit_idx < Layout::kNumLoUnits ? dst_lo + scale_unit_idx
-                                                                                      : dst_hi + (scale_unit_idx - Layout::kNumLoUnits),
-                                                  make_int4(__float_as_int(scale_inv_lo), flag, __float_as_int(scale_inv_hi), flag));
-                        }
-                        if (unit_idx == 0)
-                            st_volatile_global_v4(dst_hi + (Layout::kSrcUnit - Layout::kNumLoUnits), make_int4(token_idx, flag, 0, flag));
-                    }
-                }
-                __syncthreads();
-            }
-            goto PAYLOAD_FLAGS_DISPATCH_RECV;
-        }
-
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             if (warp_id < num_topk) {
                 const int dst_expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id));
@@ -2845,14 +2764,12 @@ void dispatch_payload_flags(void* packed_recv_x,
                             cudaStream_t stream,
                             int phases,
                             bool unit_recv,
-                            bool fast_send,
-                            bool split_send) {
+                            bool fast_send) {
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
     const int num_sms = ceil_div(num_experts, num_warp_groups);
     EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 1 and num_sms <= kPayloadFlagsNumSeqSlots);
     EP_HOST_ASSERT(num_topk <= kPayloadFlagsDispatchNumMaxTopk and num_topk <= num_warp_groups * num_warps_per_group);
-    EP_HOST_ASSERT(not split_send or num_warp_groups * num_warps_per_group * 32 == 1024);
     EP_HOST_ASSERT(hidden % 256 == 0 and hidden <= 8192);
     const size_t num_slot_bytes = ((hidden / 8 + hidden / 256 + 2) / 2) * sizeof(int4);
     EP_HOST_ASSERT(static_cast<size_t>(num_experts) * num_max_dispatch_tokens_per_rank * num_slot_bytes + num_experts * sizeof(int4) <=
@@ -2870,7 +2787,7 @@ void dispatch_payload_flags(void* packed_recv_x,
                       packed_recv_count, cumulative_local_expert_recv_stats, rdma_recv_x, rdma_send_x,             \
                       x, topk_idx, next_clean, num_next_clean_int, seq_counters,                                   \
                       num_tokens, num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks,        \
-                      num_warp_groups, num_warps_per_group, round_scale, phases, unit_recv, fast_send, split_send); \
+                      num_warp_groups, num_warps_per_group, round_scale, phases, unit_recv, fast_send);            \
     }                                                                                                              \
     break
 
