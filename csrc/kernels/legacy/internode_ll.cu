@@ -2006,6 +2006,8 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 // With cta_clean, every CTA clears the next buffer's signals itself and fences before its own sends,
 // instead of waiting for CTA 0's clean through the shared clean flag.
 constexpr int kPayloadFlagsNumSeqSlots = 256;
+
+// Further options of the fast-send payload-flags combine, as bits of its `ext_opts`
 constexpr size_t kPayloadFlagsSeqOffsetBytes = 16 * 1024 * 1024;
 
 __device__ __forceinline__ int payload_flags_value(const int& seq) {
@@ -2036,7 +2038,7 @@ combine_payload_flags(void* combined_x,
                       int num_max_dispatch_tokens_per_rank,
                       int num_experts, int rank, int num_ranks,
                       int num_warp_groups, int num_warps_per_group,
-                      int phases, bool cta_clean, bool tile_recv, bool fast_send) {
+                      int phases, bool cta_clean, bool tile_recv, bool fast_send, int ext_opts) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -2325,7 +2327,8 @@ void combine_payload_flags(void* combined_x,
                            int phases,
                            bool cta_clean,
                            bool tile_recv,
-                           bool fast_send) {
+                           bool fast_send,
+                           int ext_opts) {
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
     const int num_sms = ceil_div(num_experts, num_warp_groups);
@@ -2335,6 +2338,7 @@ void combine_payload_flags(void* combined_x,
         buffer_idx * 2 * kPayloadFlagsNumSeqSlots;
     EP_HOST_ASSERT(not tile_recv or (num_topk == 8 and num_warp_groups * num_warps_per_group * 32 == 1024));
     EP_HOST_ASSERT(not fast_send or cta_clean);
+    EP_HOST_ASSERT(fast_send or ext_opts == 0);
     EP_HOST_ASSERT(kPayloadFlagsSeqOffsetBytes + 4 * kPayloadFlagsNumSeqSlots * sizeof(int) <= LEGACY_NUM_WORKSPACE_BYTES);
 
     cudaLaunchConfig_t cfg = {static_cast<unsigned int>(num_sms), static_cast<unsigned int>(num_warp_groups * num_warps_per_group * 32), 0, stream, nullptr, 0};
@@ -2345,7 +2349,8 @@ void combine_payload_flags(void* combined_x,
                       src_info, layout_range, next_clean, num_next_clean_int,                         \
                       atomic_clean_flag, seq_counters, num_combined_tokens, num_topk,                 \
                       num_max_dispatch_tokens_per_rank, num_experts, rank, num_ranks,                 \
-                      num_warp_groups, num_warps_per_group, phases, cta_clean, tile_recv, fast_send); \
+                      num_warp_groups, num_warps_per_group, phases, cta_clean, tile_recv, fast_send,  \
+                      ext_opts);                                                                      \
     }                                                                                                 \
     break
     SWITCH_HIDDEN(PAYLOAD_FLAGS_COMBINE_LAUNCH_CASE);
@@ -2382,7 +2387,7 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
                        int num_tokens, int num_max_dispatch_tokens_per_rank, int num_topk,
                        int num_experts, int rank, int num_ranks,
                        int num_warp_groups, int num_warps_per_group,
-                       bool round_scale, int phases, bool unit_recv, bool fast_send) {
+                       bool round_scale, int phases, bool unit_recv, bool fast_send, int ext_opts) {
     using Layout = PayloadFlagsDispatchLayout<kHidden>;
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
     using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
@@ -2764,7 +2769,8 @@ void dispatch_payload_flags(void* packed_recv_x,
                             cudaStream_t stream,
                             int phases,
                             bool unit_recv,
-                            bool fast_send) {
+                            bool fast_send,
+                            int ext_opts) {
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
     const int num_sms = ceil_div(num_experts, num_warp_groups);
@@ -2787,7 +2793,7 @@ void dispatch_payload_flags(void* packed_recv_x,
                       packed_recv_count, cumulative_local_expert_recv_stats, rdma_recv_x, rdma_send_x,             \
                       x, topk_idx, next_clean, num_next_clean_int, seq_counters,                                   \
                       num_tokens, num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks,        \
-                      num_warp_groups, num_warps_per_group, round_scale, phases, unit_recv, fast_send);            \
+                      num_warp_groups, num_warps_per_group, round_scale, phases, unit_recv, fast_send, ext_opts);  \
     }                                                                                                              \
     break
 

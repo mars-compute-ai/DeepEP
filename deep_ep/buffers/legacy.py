@@ -559,7 +559,7 @@ class Buffer:
                              use_nvfp4: bool = False,
                              async_finish: bool = False, return_recv_hook: bool = False,
                              payload_flags: bool = False, payload_flags_unit_recv: bool = False,
-                             payload_flags_fast_send: bool = False) -> \
+                             payload_flags_fast_send: bool = False, payload_flags_ext: int = 0) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         A low-latency implementation for dispatching with IBGDA.
@@ -596,6 +596,8 @@ class Buffer:
                 FP8 over NVLink P2P to every rank only, without rank masking or wait-cost stats.
             payload_flags_unit_recv: with `payload_flags`, every thread of a receiving warp group polls its own
                 (token, unit) items, a batch at once, reloading only the pending ones.
+            payload_flags_ext: with `payload_flags`, a bit set of further payload-flags dispatch options
+                (`PAYLOAD_FLAGS_DISPATCH_*` in internode_ll.cu); 0 keeps the kernel unchanged.
             payload_flags_fast_send: with `payload_flags`, the counting warp reads its share of the next buffer's signals
                 in the sequence's round trip and clears it (and fences) before the counts only when one is set.
 
@@ -634,7 +636,8 @@ class Buffer:
                                               use_fp8, round_scale, use_ue8m0,
                                               use_nvfp4,
                                               async_finish, return_recv_hook,
-                                              payload_flags, payload_flags_unit_recv, payload_flags_fast_send)
+                                              payload_flags, payload_flags_unit_recv, payload_flags_fast_send,
+                                              payload_flags_ext)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx,
                              packed_recv_x, packed_recv_x_scales, packed_recv_count,
@@ -653,7 +656,8 @@ class Buffer:
                             combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
                             overlap: bool = False, src_signals: Optional[torch.Tensor] = None, src_signal_expect_value: int = 0,
                             payload_flags: bool = False, payload_flags_cta_clean: bool = False,
-                            payload_flags_tile_recv: bool = False, payload_flags_fast_send: bool = False) -> \
+                            payload_flags_tile_recv: bool = False, payload_flags_fast_send: bool = False,
+                            payload_flags_ext: int = 0) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
@@ -686,6 +690,8 @@ class Buffer:
                 its own sends, instead of all senders waiting for SM 0's clean through a shared flag.
             payload_flags_tile_recv: with `payload_flags`, receive in tiles of (token, 128 units): every thread polls one
                 top-k unit and the slots are summed through shared memory in top-k order (top-k 8 only).
+            payload_flags_ext: with `payload_flags_fast_send`, a bit set of further payload-flags combine options
+                (`PAYLOAD_FLAGS_COMBINE_*` in internode_ll.cu); 0 keeps the fast-send kernel unchanged.
             payload_flags_fast_send: with `payload_flags_cta_clean`, read the next buffer's signals and the send layout
                 in the sequence's round trip, clear the signals (and fence) only when one is set, and map each peer's
                 buffer once per warp group.
@@ -709,7 +715,8 @@ class Buffer:
                                                                    out,
                                                                    overlap, src_signals, src_signal_expect_value,
                                                                    payload_flags, payload_flags_cta_clean,
-                                                                   payload_flags_tile_recv, payload_flags_fast_send)
+                                                                   payload_flags_tile_recv, payload_flags_fast_send,
+                                                                   payload_flags_ext)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
         return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
 

@@ -1475,8 +1475,10 @@ public:
                          bool return_recv_hook,
                          bool payload_flags = false,
                          bool payload_flags_unit_recv = false,
-                         bool payload_flags_fast_send = false) {
+                         bool payload_flags_fast_send = false,
+                         int payload_flags_ext = 0) {
         EP_HOST_ASSERT(low_latency_mode);
+        EP_HOST_ASSERT(payload_flags or payload_flags_ext == 0);
         EP_HOST_ASSERT(payload_flags or not payload_flags_unit_recv);
         EP_HOST_ASSERT(payload_flags or not payload_flags_fast_send);
         EP_HOST_ASSERT(not payload_flags or (use_fp8 and not use_nvfp4 and mask_buffer_ptr == nullptr and
@@ -1607,7 +1609,8 @@ public:
                                                      launch_stream,
                                                      phases,
                                                      payload_flags_unit_recv,
-                                                     payload_flags_fast_send);
+                                                     payload_flags_fast_send,
+                                                     payload_flags_ext);
                 return;
             }
             internode_ll::dispatch(
@@ -1688,8 +1691,10 @@ public:
         bool payload_flags = false,
         bool payload_flags_cta_clean = false,
         bool payload_flags_tile_recv = false,
-        bool payload_flags_fast_send = false) {
+        bool payload_flags_fast_send = false,
+        int payload_flags_ext = 0) {
         EP_HOST_ASSERT(low_latency_mode);
+        EP_HOST_ASSERT(payload_flags_fast_send or payload_flags_ext == 0);
         EP_HOST_ASSERT(payload_flags_cta_clean or not payload_flags_fast_send);
         EP_HOST_ASSERT(not payload_flags or (not use_logfmt and not zero_copy and not overlap and mask_buffer_ptr == nullptr));
         EP_HOST_ASSERT(payload_flags or not payload_flags_cta_clean);
@@ -1776,7 +1781,8 @@ public:
                                                     phases,
                                                     payload_flags_cta_clean,
                                                     payload_flags_tile_recv,
-                                                    payload_flags_fast_send);
+                                                    payload_flags_fast_send,
+                                                    payload_flags_ext);
                 return;
             }
             internode_ll::combine(combined_x.data_ptr(),
