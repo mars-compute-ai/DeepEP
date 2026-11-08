@@ -1,6 +1,7 @@
 #include "compiled.cuh"
 #include "ibgda_device.cuh"
 #include "launch.cuh"
+#include "api.cuh"
 
 namespace deep_ep::legacy {
 
@@ -2016,6 +2017,10 @@ __device__ __forceinline__ int payload_flags_value(const int& seq) {
     return static_cast<int>(static_cast<uint32_t>(seq) * 2654435761u) | 1;
 }
 
+__device__ __forceinline__ int payload_flags_topk(const topk_idx_t* topk_idx, const int& i, const bool& is_int32) {
+    return is_int32 ? __ldg(reinterpret_cast<const int*>(topk_idx) + i) : static_cast<int>(__ldg(topk_idx + i));
+}
+
 __device__ __forceinline__ void st_volatile_global_v4(const int4* ptr, const int4& value) {
     asm volatile("st.volatile.global.v4.s32 [%0], {%1, %2, %3, %4};"
                  ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w) : "memory");
@@ -2217,7 +2222,7 @@ PAYLOAD_FLAGS_RECV:
             const int unit = (tile % kNumTiles) * kTileUnits + unit_in_tile;
             int2 data = make_int2(0, 0);
             float weight = 0.0f;
-            const int expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + topk_slot));
+            const int expert_idx = payload_flags_topk(topk_idx, token_idx * num_topk + topk_slot, ext_opts & kPayloadFlagsCombineInt32Ids);
             if (expert_idx >= 0) {
                 weight = __ldg(topk_weights + token_idx * num_topk + topk_slot);
                 const auto recv_base = static_cast<const uint8_t*>(unit < kNumHalfUnits ? rdma_recv_x : rdma_send_x);
@@ -2287,7 +2292,7 @@ PAYLOAD_FLAGS_RECV:
                             list_weight[k] = 0.0f;
                             const int topk_slot = k_base + k;
                             if (topk_slot < num_topk) {
-                                const int expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + topk_slot));
+                                const int expert_idx = payload_flags_topk(topk_idx, token_idx * num_topk + topk_slot, ext_opts & kPayloadFlagsCombineInt32Ids);
                                 if (expert_idx >= 0) {
                                     list_weight[k] = __ldg(topk_weights + token_idx * num_topk + topk_slot);
                                     list_ptr[k] = reinterpret_cast<const int4*>(
@@ -2495,7 +2500,7 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
             for (int expert_idx = expert_begin_idx; expert_idx < expert_end_idx; ++expert_idx) {
                 int count = 0;
                 for (int i = lane_id; i < num_tokens * num_topk; i += 32)
-                    count += static_cast<int>(__ldg(topk_idx + i)) == expert_idx;
+                    count += payload_flags_topk(topk_idx, i, ext_opts & kPayloadFlagsDispatchInt32Ids) == expert_idx;
                 count = warp_reduce_sum(count);
                 if (lane_id == 0) {
                     const auto dst_rank = expert_idx / num_local_experts;
@@ -2514,11 +2519,11 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
         const int unit_idx = thread_id % Layout::kNumDataUnits;
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             if (warp_id < num_topk) {
-                const int dst_expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id));
+                const int dst_expert_idx = payload_flags_topk(topk_idx, token_idx * num_topk + warp_id, ext_opts & kPayloadFlagsDispatchInt32Ids);
                 int slot_idx = 0;
                 if (dst_expert_idx >= 0) {
                     for (int i = lane_id; i < token_idx * num_topk; i += 32)
-                        slot_idx += static_cast<int>(__ldg(topk_idx + i)) == dst_expert_idx;
+                        slot_idx += payload_flags_topk(topk_idx, i, ext_opts & kPayloadFlagsDispatchInt32Ids) == dst_expert_idx;
                     slot_idx = warp_reduce_sum(slot_idx);
                 }
                 if (lane_id == 0) {

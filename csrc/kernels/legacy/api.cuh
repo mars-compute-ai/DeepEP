@@ -320,6 +320,10 @@ void combine(void* combined_x,
              uint32_t* src_signals,
              uint32_t src_signal_expect_value);
 
+// Int32 ids: the payload-flags dispatch and combine read int32 top-k ids, as a router writes them, instead of int64
+constexpr int kPayloadFlagsDispatchInt32Ids = 2;
+constexpr int kPayloadFlagsCombineInt32Ids = 4;
+
 void combine_payload_flags(void* combined_x,
                            void* rdma_recv_x,
                            void* rdma_send_x,

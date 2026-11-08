@@ -1490,7 +1490,8 @@ public:
         EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % 128 == 0);
         EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
         EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
-        EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
+        EP_HOST_ASSERT(topk_idx.scalar_type() == ((payload_flags_ext & internode_ll::kPayloadFlagsDispatchInt32Ids)
+                                                      ? torch::kInt32 : c10::CppTypeToScalarType<topk_idx_t>::value));
         EP_HOST_ASSERT(num_experts % num_ranks == 0);
 
         // Diagnosis tensors
@@ -1591,7 +1592,7 @@ public:
                                                      buffer.dispatch_rdma_send_buffer,
                                                      num_region_bytes,
                                                      x.data_ptr(),
-                                                     topk_idx.data_ptr<topk_idx_t>(),
+                                                     static_cast<const topk_idx_t*>(topk_idx.data_ptr()),
                                                      next_clean_meta.first,
                                                      next_clean_meta.second,
                                                      num_tokens,
@@ -1707,7 +1708,8 @@ public:
         EP_HOST_ASSERT(x.size(2) % sizeof(int4) == 0 and x.size(2) % 128 == 0);
         EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
         EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and topk_idx.size(1) == topk_weights.size(1));
-        EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
+        EP_HOST_ASSERT(topk_idx.scalar_type() == ((payload_flags_ext & internode_ll::kPayloadFlagsCombineInt32Ids)
+                                                      ? torch::kInt32 : c10::CppTypeToScalarType<topk_idx_t>::value));
         EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
         EP_HOST_ASSERT(topk_weights.size(0) <= num_max_dispatch_tokens_per_rank);
         EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
@@ -1761,7 +1763,7 @@ public:
                                                     buffer.combine_rdma_recv_data_buffer,
                                                     buffer.combine_rdma_send_buffer,
                                                     x.data_ptr(),
-                                                    topk_idx.data_ptr<topk_idx_t>(),
+                                                    static_cast<const topk_idx_t*>(topk_idx.data_ptr()),
                                                     topk_weights.data_ptr<float>(),
                                                     src_info.data_ptr<int>(),
                                                     layout_range.data_ptr<int64_t>(),
