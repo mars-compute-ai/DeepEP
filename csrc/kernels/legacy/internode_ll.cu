@@ -2396,6 +2396,12 @@ constexpr int kPayloadFlagsDispatchNumMaxTopk = 16;
 constexpr int kPayloadFlagsDispatchRecvBatch = 6;
 constexpr int kPayloadFlagsDispatchUnitRecvBatch = 4;
 
+// Peer table: each peer's heap offset is read once per CTA in the sequence's round trip, so neither the count units
+// nor a token's destinations wait on a peer-base load after it (an option bit of the dispatch's `ext_opts`)
+constexpr int PAYLOAD_FLAGS_DISPATCH_PEER_TABLE = 4;
+constexpr int kPayloadFlagsDispatchNumMaxPeers = 16;
+constexpr int64_t kPayloadFlagsDispatchNoPeer = INT64_MIN;
+
 template <int kHidden>
 struct PayloadFlagsDispatchLayout {
     static constexpr int kNumDataUnits = kHidden / (sizeof(int4) / sizeof(nv_bfloat16));
@@ -2445,6 +2451,17 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
     __shared__ uint64_t shared_dst_hi[kPayloadFlagsDispatchNumMaxTopk];
     __shared__ int shared_num_recv_tokens[kNumMaxWarpGroups];
     __shared__ int shared_recv_token_begin_idx[kNumMaxWarpGroups];
+    __shared__ int64_t shared_peer_delta[kPayloadFlagsDispatchNumMaxPeers];
+    const bool is_peer_table = ext_opts & PAYLOAD_FLAGS_DISPATCH_PEER_TABLE;
+    if (is_peer_table and (phases & LEGACY_LOW_LATENCY_SEND_PHASE) and thread_id < num_ranks) {
+        int64_t delta = 0;
+        if (thread_id != rank) {
+            const auto peer_base = __ldg(reinterpret_cast<uint64_t*>(nvshmemi_device_state_d.peer_heap_base_p2p) + thread_id);
+            delta = peer_base == 0 ? kPayloadFlagsDispatchNoPeer
+                                   : static_cast<int64_t>(peer_base - reinterpret_cast<uint64_t>(nvshmemi_device_state_d.heap_base));
+        }
+        shared_peer_delta[thread_id] = delta;
+    }
 
     // Fast send: the counting warp reads its share of the next buffer's signals in the sequence's round trip, and
     // clears it (with its fence) only when a shipped kernel left one set
@@ -2507,7 +2524,14 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
                     const auto dst_expert_local_idx = expert_idx % num_local_experts;
                     const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_send_x) + num_hi_region_bytes +
                         (dst_expert_local_idx * num_ranks + rank) * sizeof(int4);
-                    const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                    uint64_t dst_p2p_ptr;
+                    if (is_peer_table) {
+                        const auto delta = shared_peer_delta[dst_rank];
+                        EP_DEVICE_ASSERT(delta != kPayloadFlagsDispatchNoPeer);
+                        dst_p2p_ptr = dst_ptr + delta;
+                    } else {
+                        dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                    }
                     EP_DEVICE_ASSERT(dst_p2p_ptr != 0);
                     st_volatile_global_v4(reinterpret_cast<int4*>(dst_p2p_ptr), make_int4(count, flag, count, flag));
                 }
@@ -2534,8 +2558,15 @@ dispatch_payload_flags(void* packed_recv_x, void* packed_recv_x_scales, int* pac
                         const auto slot_offset =
                             ((static_cast<size_t>(dst_expert_local_idx) * num_ranks + rank) * num_max_dispatch_tokens_per_rank + slot_idx) *
                             Layout::kNumSlotBytes;
-                        dst_lo = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x) + slot_offset, rank, dst_rank);
-                        dst_hi = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_send_x) + slot_offset, rank, dst_rank);
+                        if (is_peer_table) {
+                            const auto delta = shared_peer_delta[dst_rank];
+                            EP_DEVICE_ASSERT(delta != kPayloadFlagsDispatchNoPeer);
+                            dst_lo = reinterpret_cast<uint64_t>(rdma_recv_x) + slot_offset + delta;
+                            dst_hi = reinterpret_cast<uint64_t>(rdma_send_x) + slot_offset + delta;
+                        } else {
+                            dst_lo = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x) + slot_offset, rank, dst_rank);
+                            dst_hi = nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_send_x) + slot_offset, rank, dst_rank);
+                        }
                         EP_DEVICE_ASSERT(dst_lo != 0 and dst_hi != 0);
                     }
                     shared_dst_lo[warp_id] = dst_lo;
@@ -2814,6 +2845,7 @@ void dispatch_payload_flags(void* packed_recv_x,
     auto seq_counters = reinterpret_cast<int*>(static_cast<uint8_t*>(workspace) + kPayloadFlagsDispatchSeqOffsetBytes) +
         buffer_idx * 2 * kPayloadFlagsNumSeqSlots;
     EP_HOST_ASSERT(kPayloadFlagsDispatchSeqOffsetBytes + 4 * kPayloadFlagsNumSeqSlots * sizeof(int) <= LEGACY_NUM_WORKSPACE_BYTES);
+    EP_HOST_ASSERT(not (ext_opts & PAYLOAD_FLAGS_DISPATCH_PEER_TABLE) or num_ranks <= kPayloadFlagsDispatchNumMaxPeers);
 
 #define PAYLOAD_FLAGS_DISPATCH_LAUNCH_CASE(hidden)                                                                 \
     {                                                                                                              \
