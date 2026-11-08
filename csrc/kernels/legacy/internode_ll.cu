@@ -2008,6 +2008,8 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 constexpr int kPayloadFlagsNumSeqSlots = 256;
 
 // Further options of the fast-send payload-flags combine, as bits of its `ext_opts`
+// Group check: each peer's base is checked once per warp group, so an item's x loads do not wait on its src_info
+constexpr int PAYLOAD_FLAGS_COMBINE_GROUP_CHECK = 2;
 constexpr size_t kPayloadFlagsSeqOffsetBytes = 16 * 1024 * 1024;
 
 __device__ __forceinline__ int payload_flags_value(const int& seq) {
@@ -2144,8 +2146,32 @@ combine_payload_flags(void* combined_x,
                 ;
         }
         __syncwarp();
+        if (ext_opts & PAYLOAD_FLAGS_COMBINE_GROUP_CHECK) {
+            // Group check: an item's src_info and x loads are issued together, its peer address formed after them
+            constexpr int kUnitsPerLane = kChunkUnits / 32;
+            EP_STATIC_ASSERT(kChunkUnits % 32 == 0 and kChunkUnits * kNumChunks == kNumUnits, "Chunks must split into lanes");
+            EP_DEVICE_ASSERT(dst_lo_base != 0 and dst_hi_base != 0);
+            for (int item = sub_warp_id; item < num_tokens_to_send * kNumChunks; item += num_warps_per_group) {
+                const int token_idx = offset + item / kNumChunks;
+                const int unit_begin = (item % kNumChunks) * kChunkUnits + lane_id;
+                const auto x_int2 = reinterpret_cast<const int2*>(local_x + token_idx * kHiddenInt4);
+                const auto src_idx = __ldg(local_src_info + token_idx);
+                int2 list_value[kUnitsPerLane];
+                #pragma unroll
+                for (int j = 0; j < kUnitsPerLane; ++j)
+                    list_value[j] = __ldg(x_int2 + unit_begin + j * 32);
+                const auto slot_offset = (static_cast<uint64_t>(global_expert_idx) * num_max_dispatch_tokens_per_rank + src_idx) * kNumBytesPerSlot;
+                #pragma unroll
+                for (int j = 0; j < kUnitsPerLane; ++j) {
+                    const int unit = unit_begin + j * 32;
+                    const auto dst = reinterpret_cast<int4*>(unit < kNumHalfUnits ? dst_lo_base + slot_offset : dst_hi_base + slot_offset) +
+                        (unit % kNumHalfUnits);
+                    st_volatile_global_v4(dst, make_int4(list_value[j].x, flag, list_value[j].y, flag));
+                }
+            }
+        }
 
-        for (int item = sub_warp_id; item < num_tokens_to_send * kNumChunks; item += num_warps_per_group) {
+        for (int item = (ext_opts & PAYLOAD_FLAGS_COMBINE_GROUP_CHECK) ? num_tokens_to_send * kNumChunks : sub_warp_id; item < num_tokens_to_send * kNumChunks; item += num_warps_per_group) {
             const int token_idx = offset + item / kNumChunks;
             const int chunk_idx = item % kNumChunks;
             const auto src_idx = __ldg(local_src_info + token_idx);
